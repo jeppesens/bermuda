@@ -6,7 +6,7 @@
 
 - Track bluetooth devices by Area (Room) in [Home Assistant](https://home-assistant.io/), using [ESPHome](https://esphome.io/) [Bluetooth Proxies](https://esphome.io/components/bluetooth_proxy.html) and Shelly Gen2 or later devices.
 
-- (eventually) Triangulate device positions! Like, on a map. Maybe.
+- **NEW**: Trilateration support for precise (x, y, z) position tracking using multiple bluetooth proxies with configured coordinates!
 
 
 [![GitHub Release][releases-shield]][releases]
@@ -37,6 +37,126 @@ Bermuda aims to let you track any bluetooth device, and have Home Assistant tell
 - Configurable settings for rssi reference level, environmental attenuation, max tracking radius
 - Provides a comprehensive json/yaml dump of devices and their distances from each bluetooth
   receiver, via the `bermuda.dump_devices` service.
+
+## Trilateration (3D Position Tracking)
+
+Bermuda now supports **trilateration** - calculating the precise (x, y, z) position of tracked devices using distance measurements from multiple bluetooth proxies with known coordinates.
+
+### How it works:
+
+- **4+ scanners**: Precise 3D positioning (x, y, z) with high confidence
+- **3 scanners**: Reliable 2D positioning (x, y), potentially 3D if scanners are at different heights
+- **2 scanners**: Ambiguous positioning with disambiguation using movement history and velocity limits
+- **1 scanner**: Distance-only tracking with low confidence
+
+### Setup:
+
+1. **Configure scanner positions and room boundaries**: Create a `scanner_positions.json` file in your Home Assistant config directory with the physical locations of your bluetooth proxies and room polygons:
+
+```json
+{
+  "floors": [
+    {
+      "id": "ground",
+      "name": "Ground Floor",
+      "bounds": [[0, 0, 0], [10, 8, 3]]
+    }
+  ],
+  "rooms": [
+    {
+      "id": "living_room",
+      "name": "Living Room",
+      "floor": "ground",
+      "area_id": "living_room",
+      "points": [
+        [0.0, 0.0],
+        [4.0, 0.0],
+        [4.0, 3.0],
+        [0.0, 3.0]
+      ]
+    },
+    {
+      "id": "kitchen",
+      "name": "Kitchen",
+      "floor": "ground",
+      "area_id": "kitchen",
+      "points": [
+        [0.0, 3.0],
+        [4.0, 3.0],
+        [4.0, 8.0],
+        [0.0, 8.0]
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "AA:BB:CC:DD:EE:FF",
+      "name": "Living Room Proxy",
+      "point": [2.0, 1.5, 1.0]
+    },
+    {
+      "id": "11:22:33:44:55:66",
+      "name": "Bedroom Proxy",
+      "point": [7.0, 2.5, 1.0]
+    }
+  ]
+}
+```
+
+**Key fields:**
+- `floors`: Define floor boundaries for multi-floor homes
+  - `bounds`: [[min_x, min_y, min_z], [max_x, max_y, max_z]]
+- `rooms`: Define room polygons for automatic area detection
+  - `area_id`: Must match your Home Assistant Area ID
+  - `points`: Polygon vertices in [x, y] coordinates (clockwise or counter-clockwise)
+- `nodes`: Scanner positions
+  - `id`: MAC address of your bluetooth proxy (must match exactly)
+  - `point`: [x, y, z] coordinates in meters
+
+**Coordinate system:**
+- Choose any origin point (e.g., bottom-left corner of your floorplan)
+- x, y: horizontal position in meters
+- z: height above floor (typically 0.5-2.0 meters for wall-mounted proxies)
+
+2. **Restart Home Assistant** to load the scanner positions
+
+3. **Enable the Position sensor** for your tracked devices in the entity settings (disabled by default until scanner positions are configured)
+
+### Position Sensor:
+
+The Position sensor provides:
+- **State**: Formatted coordinates like `(2.5, 3.1, 1.0)`
+- **Attributes**:
+  - `x`, `y`, `z`: Individual coordinate values
+  - `confidence`: Percentage (0-100) indicating position accuracy
+  - `method`: Algorithm used (`1-scanner`, `2-scanner`, `3-scanner`, `4+scanner`)
+  - `scanner_count`: Number of scanners used in calculation
+  - `room_id`, `room_name`, `floor_id`: Detected room/floor (when rooms are configured)
+
+### Automatic Area Detection:
+
+When rooms are defined in `scanner_positions.json`, Bermuda automatically:
+- **Calculates device position** from scanner distances
+- **Determines which room** the device is in using point-in-polygon detection
+- **Updates the Area sensor** to match the detected room
+- **Overrides distance-based area assignment** for more accurate room presence
+
+This means your device's Area sensor will update based on precise position rather than just "closest scanner", providing much more accurate room-level presence detection!
+
+**Configuration:**
+- `trilateration_override_area` (default: true) - Use position to set device area
+- `trilateration_area_min_confidence` (default: 30%) - Minimum confidence to override area
+
+### Tips:
+
+- Place proxies at room corners for best coverage
+- Height variation (z-coordinate) improves 3D accuracy
+- Use at least 3 proxies for reliable positioning
+- Define room polygons matching your Home Assistant Areas for automatic area detection
+- The `confidence` attribute helps you filter unreliable positions in automations
+- Example: `scanner_positions.json.example` is included in the Bermuda directory
+
+See [the Wiki](https://github.com/agittins/bermuda/wiki/) for detailed setup guides and troubleshooting.
 
 ## What you need:
 

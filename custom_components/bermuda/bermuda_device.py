@@ -110,6 +110,13 @@ class BermudaDevice(dict):
         self.area_rssi: float | None = None  # rssi from closest scanner
         self.area_advert: BermudaAdvert | None = None  # currently closest BermudaScanner
 
+        # Trilateration/position tracking
+        self.position: tuple[float, float, float] | None = None  # (x, y, z) in meters for scanners
+        self.calculated_position: tuple[float, float, float] | None = None  # (x, y, z) for tracked devices
+        self.position_confidence: float | None = None  # Confidence percentage (0-100)
+        self.position_timestamp: float | None = None  # When position was last calculated
+        self.position_method: str | None = None  # "1-scanner", "2-scanner", "3-scanner", "4+scanner"
+
         self.floor: fr.FloorEntry | None = None
         self.floor_id: str | None = None
         self.floor_name: str | None = None

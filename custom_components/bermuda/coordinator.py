@@ -54,6 +54,7 @@ from homeassistant.util.dt import get_age, now
 
 from .bermuda_device import BermudaDevice
 from .bermuda_irk import BermudaIrkManager
+from .trilateration import calculate_position
 from .const import (
     _LOGGER,
     _LOGGER_SPAM_LESS,
@@ -64,11 +65,15 @@ from .const import (
     CONF_ATTENUATION,
     CONF_DEVICES,
     CONF_DEVTRACK_TIMEOUT,
+    CONF_ENABLE_TRILATERATION,
     CONF_MAX_RADIUS,
     CONF_MAX_VELOCITY,
+    CONF_MIN_TRILATERATION_SCANNERS,
     CONF_REF_POWER,
     CONF_RSSI_OFFSETS,
     CONF_SMOOTHING_SAMPLES,
+    CONF_TRILATERATION_AREA_MIN_CONFIDENCE,
+    CONF_TRILATERATION_OVERRIDE_AREA,
     CONF_UPDATE_INTERVAL,
     DEFAULT_ATTENUATION,
     DEFAULT_DEVTRACK_TIMEOUT,
@@ -190,6 +195,10 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         self._scanners: set[BermudaDevice] = set()  # Set of all in self.devices that is_scanner=True
         self.irk_manager = BermudaIrkManager()
 
+        # Map/floor plan data for trilateration
+        self.map_floors: dict[str, dict] = {}
+        self.map_rooms: dict[str, dict] = {}
+
         self.ar = ar.async_get(self.hass)
         self.er = er.async_get(self.hass)
         self.dr = dr.async_get(self.hass)
@@ -222,6 +231,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # First time around we freshen the restored scanner info by
         # forcing a scan of the captured info.
         self._scanner_init_pending = True
+        self._scanner_positions_loaded = False  # Track if we've loaded scanner positions
 
         self._seed_configured_devices_done = False
 
@@ -397,6 +407,93 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         finally:
             # Ensure that an issue reading these files (which are optional, really) doesn't stop the whole show.
             self._waitingfor_load_manufacturer_ids = False
+
+    async def async_load_scanner_positions(self):
+        """Load scanner positions from JSON file for trilateration."""
+        try:
+            import json
+            from pathlib import Path
+
+            # Try multiple locations for the scanner_positions.json file
+            # 1. Config directory
+            config_path = Path(self.hass.config.config_dir) / "scanner_positions.json"
+            # 2. Custom components directory
+            custom_path = Path(__file__).parent / "scanner_positions.json"
+
+            file_path = None
+            if config_path.exists():
+                file_path = config_path
+            elif custom_path.exists():
+                file_path = custom_path
+
+            if file_path is None:
+                _LOGGER.debug("No scanner_positions.json file found - trilateration disabled")
+                return
+
+            async with aiofiles.open(file_path) as f:
+                content = await f.read()
+                data = json.loads(content)
+
+            # Load floors
+            for floor in data.get("floors", []):
+                self.map_floors[floor["id"]] = floor
+                _LOGGER.debug("Loaded floor: %s (%s)", floor["id"], floor.get("name"))
+
+            # Load rooms
+            for room in data.get("rooms", []):
+                self.map_rooms[room["id"]] = room
+                _LOGGER.debug(
+                    "Loaded room: %s (%s) with %d vertices",
+                    room["id"],
+                    room.get("name"),
+                    len(room.get("points", [])),
+                )
+
+            # Parse and apply scanner positions
+            positions_loaded = 0
+            for node in data.get("nodes", []):
+                node_id = mac_norm(node["id"])  # Normalize MAC address
+                point = node.get("point")
+
+                if not point or len(point) != 3:
+                    _LOGGER.warning("Invalid position for scanner %s: %s", node_id, point)
+                    continue
+
+                # Find the scanner device and assign position
+                if node_id in self.devices:
+                    device = self.devices[node_id]
+                    if device.is_scanner:
+                        device.position = (float(point[0]), float(point[1]), float(point[2]))
+                        positions_loaded += 1
+                        _LOGGER.info(
+                            "Loaded position for scanner %s (%s): (%.2f, %.2f, %.2f)",
+                            node.get("name", node_id),
+                            node_id,
+                            point[0],
+                            point[1],
+                            point[2],
+                        )
+                    else:
+                        _LOGGER.warning("Device %s is not a scanner, skipping position assignment", node_id)
+                else:
+                    _LOGGER.debug("Scanner %s not found in devices yet, will retry on next update", node_id)
+
+            if positions_loaded > 0:
+                _LOGGER.info("Loaded %d scanner positions for trilateration", positions_loaded)
+            else:
+                _LOGGER.warning("No valid scanner positions loaded from %s", file_path)
+
+            if len(self.map_rooms) > 0:
+                _LOGGER.info("Loaded %d rooms for zone detection", len(self.map_rooms))
+            if len(self.map_floors) > 0:
+                _LOGGER.info("Loaded %d floors", len(self.map_floors))
+
+        except FileNotFoundError:
+            _LOGGER.debug("scanner_positions.json not found - trilateration will be disabled")
+        except json.JSONDecodeError as err:
+            _LOGGER.error("Failed to parse scanner_positions.json: %s", err)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.exception("Unexpected error loading scanner positions: %s", err)
 
     @callback
     def handle_devreg_changes(self, ev: Event[EventDeviceRegistryUpdatedData]):
@@ -659,6 +756,60 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 # Recalculate smoothed distances, last_seen etc
                 device.calculate_data()
 
+                # Calculate trilateration position if enabled and device is tracked
+                if device.create_sensor and self.options.get(CONF_ENABLE_TRILATERATION, True):
+                    min_scanners = self.options.get(CONF_MIN_TRILATERATION_SCANNERS, 2)
+                    
+                    # Count scanners with valid positions and distances
+                    scanner_count = sum(
+                        1
+                        for advert in device.adverts.values()
+                        if (scanner := self.devices.get(advert.scanner_address))
+                        and scanner.is_scanner
+                        and scanner.position is not None
+                        and advert.rssi_distance is not None
+                        and advert.rssi_distance > 0
+                    )
+                    
+                    if scanner_count >= min_scanners:
+                        result = calculate_position(device, nowstamp)
+                        if result:
+                            device.calculated_position = (result.x, result.y, result.z)
+                            device.position_confidence = result.confidence
+                            device.position_timestamp = nowstamp
+                            device.position_method = result.method
+                            
+                            # Determine room from position and override area assignment if enabled
+                            if (
+                                self.map_rooms
+                                and self.options.get(CONF_TRILATERATION_OVERRIDE_AREA, True)
+                                and result.confidence
+                                >= self.options.get(CONF_TRILATERATION_AREA_MIN_CONFIDENCE, 30.0)
+                            ):
+                                from .trilateration import find_room_for_position
+
+                                room_area_id = find_room_for_position(
+                                    (result.x, result.y, result.z),
+                                    list(self.map_rooms.values()),
+                                    list(self.map_floors.values()) if self.map_floors else None,
+                                )
+
+                                if room_area_id:
+                                    # Map to HA Area
+                                    area = self.ar.async_get_area(room_area_id)
+                                    if area:
+                                        # Override the distance-based area assignment
+                                        device.area_id = area.id
+                                        device.area_name = area.name
+                                        device.area = area
+                                        device.area_icon = area.icon or device.area_icon
+                                        _LOGGER.debug(
+                                            "Device %s assigned to area %s via trilateration (confidence: %.1f%%)",
+                                            device.name,
+                                            area.name,
+                                            result.confidence,
+                                        )
+
             self._refresh_areas_by_min_distance()
 
             # We might need to freshen deliberately on first start if no new scanners
@@ -718,6 +869,16 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # Initialise ha_scanners if we haven't already
         if self._scanner_init_pending:
             self._refresh_scanners(force=True)
+
+        # Load scanner positions from JSON file (only once, after first scanner init)
+        if not self._scanner_positions_loaded and not self._scanner_init_pending:
+            self.config_entry.async_create_background_task(
+                self.hass,
+                self.async_load_scanner_positions(),
+                "Load scanner positions",
+                eager_start=True,
+            )
+            self._scanner_positions_loaded = True
 
         for ha_scanner in self._hascanners:
             # Create / Get the BermudaDevice for this scanner

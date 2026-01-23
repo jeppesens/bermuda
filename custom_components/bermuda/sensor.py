@@ -2,27 +2,28 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+from typing import Any
 
-from homeassistant.components.sensor import RestoreSensor, SensorEntity
-from homeassistant.components.sensor.const import SensorDeviceClass, SensorStateClass
-from homeassistant.const import (
-    SIGNAL_STRENGTH_DECIBELS_MILLIWATT,
-    STATE_UNAVAILABLE,
-    EntityCategory,
-    UnitOfLength,
-)
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.components.sensor import RestoreSensor
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor.const import SensorDeviceClass
+from homeassistant.components.sensor.const import SensorStateClass
+from homeassistant.const import SIGNAL_STRENGTH_DECIBELS_MILLIWATT
+from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.const import EntityCategory
+from homeassistant.const import UnitOfLength
+from homeassistant.core import HomeAssistant
+from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from .const import (
-    _LOGGER,
-    ADDR_TYPE_IBEACON,
-    ADDR_TYPE_PRIVATE_BLE_DEVICE,
-    SIGNAL_DEVICE_NEW,
-    SIGNAL_SCANNERS_CHANGED,
-)
-from .entity import BermudaEntity, BermudaGlobalEntity
+from .const import _LOGGER
+from .const import ADDR_TYPE_IBEACON
+from .const import ADDR_TYPE_PRIVATE_BLE_DEVICE
+from .const import SIGNAL_DEVICE_NEW
+from .const import SIGNAL_SCANNERS_CHANGED
+from .entity import BermudaEntity
+from .entity import BermudaGlobalEntity
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -78,6 +79,7 @@ async def async_setup_entry(
             entities.append(BermudaSensorRssi(coordinator, entry, address))
             entities.append(BermudaSensorAreaLastSeen(coordinator, entry, address))
             entities.append(BermudaSensorAreaSwitchReason(coordinator, entry, address))
+            entities.append(BermudaSensorPosition(coordinator, entry, address))
 
             # _LOGGER.debug("Sensor received new_device signal for %s", address)
             # We set update before add to False because we are being
@@ -589,3 +591,97 @@ class BermudaVisibleDeviceCount(BermudaGlobalSensor):
     def name(self):
         """Gets the name of the sensor."""
         return "Visible device count"
+
+
+class BermudaSensorPosition(BermudaSensor):
+    """Position sensor showing trilateration-calculated (x, y, z) coordinates."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:map-marker"
+
+    @property
+    def unique_id(self):
+        """Uniquely identify this sensor."""
+        return f"{self._device.unique_id}_position"
+
+    @property
+    def name(self):
+        """Return the name of the sensor."""
+        return "Position"
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the position as a formatted string."""
+        if self._device.calculated_position is None:
+            return self._cached_ratelimit(None)
+
+        x, y, z = self._device.calculated_position
+        return self._cached_ratelimit(f"({x:.2f}, {y:.2f}, {z:.2f})")
+
+    @property
+    def extra_state_attributes(self):
+        """Return additional attributes for the sensor."""
+        if self._device.calculated_position is None:
+            return {}
+
+        x, y, z = self._device.calculated_position
+        attrs = {
+            "x": round(x, 3),
+            "y": round(y, 3),
+            "z": round(z, 3),
+        }
+
+        if self._device.position_confidence is not None:
+            attrs["confidence"] = round(self._device.position_confidence, 1)
+
+        if self._device.position_method is not None:
+            attrs["method"] = self._device.position_method
+
+        # Count how many scanners contributed to this position
+        if hasattr(self._device, "adverts"):
+            scanner_count = sum(
+                1
+                for advert in self._device.adverts.values()
+                if (scanner := self.coordinator.devices.get(advert.scanner_address))
+                and scanner.is_scanner
+                and scanner.position is not None
+                and advert.rssi_distance is not None
+                and advert.rssi_distance > 0
+            )
+            attrs["scanner_count"] = scanner_count
+
+        # Add room detection info
+        if self.coordinator.map_rooms:
+            from .trilateration import find_room_for_position
+
+            room_id = find_room_for_position(
+                (x, y, z),
+                list(self.coordinator.map_rooms.values()),
+                list(self.coordinator.map_floors.values()) if self.coordinator.map_floors else None,
+            )
+
+            if room_id:
+                attrs["room_id"] = room_id
+                room = next(
+                    (
+                        r
+                        for r in self.coordinator.map_rooms.values()
+                        if r.get("area_id") == room_id or r.get("id") == room_id
+                    ),
+                    None,
+                )
+                if room:
+                    attrs["room_name"] = room.get("name", room_id)
+                    attrs["floor_id"] = room.get("floor")
+
+        return attrs
+
+    @property
+    def entity_registry_enabled_default(self) -> bool:
+        """Position sensor enabled by default only if trilateration is configured."""
+        # Enable if any scanners have positions configured
+        return any(
+            scanner.position is not None
+            for scanner in self.coordinator.devices.values()
+            if scanner.is_scanner
+        )
