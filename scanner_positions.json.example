@@ -1,0 +1,85 @@
+{
+  "floors": [
+    {
+      "id": "ground",
+      "name": "Ground Floor",
+      "bounds": [[0, 0, 0], [10, 8, 3]]
+    }
+  ],
+  "rooms": [
+    {
+      "id": "living_room",
+      "name": "Living Room",
+      "floor": "ground",
+      "area_id": "living_room",
+      "points": [
+        [0.0, 0.0],
+        [4.0, 0.0],
+        [4.0, 3.0],
+        [0.0, 3.0]
+      ]
+    },
+    {
+      "id": "kitchen",
+      "name": "Kitchen",
+      "floor": "ground",
+      "area_id": "kitchen",
+      "points": [
+        [0.0, 3.0],
+        [4.0, 3.0],
+        [4.0, 8.0],
+        [0.0, 8.0]
+      ]
+    },
+    {
+      "id": "bedroom",
+      "name": "Bedroom",
+      "floor": "ground",
+      "area_id": "bedroom",
+      "points": [
+        [4.0, 0.0],
+        [10.0, 0.0],
+        [10.0, 5.0],
+        [4.0, 5.0]
+      ]
+    },
+    {
+      "id": "hallway",
+      "name": "Hallway",
+      "floor": "ground",
+      "area_id": "hallway",
+      "points": [
+        [4.0, 5.0],
+        [10.0, 5.0],
+        [10.0, 8.0],
+        [4.0, 8.0]
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "AA:BB:CC:DD:EE:FF",
+      "name": "Living Room Proxy",
+      "point": [2.0, 1.5, 1.0],
+      "floor": "ground"
+    },
+    {
+      "id": "11:22:33:44:55:66",
+      "name": "Bedroom Proxy",
+      "point": [7.0, 2.5, 1.0],
+      "floor": "ground"
+    },
+    {
+      "id": "99:88:77:66:55:44",
+      "name": "Kitchen Proxy",
+      "point": [2.0, 5.5, 1.0],
+      "floor": "ground"
+    },
+    {
+      "id": "AA:AA:BB:BB:CC:CC",
+      "name": "Hallway Proxy",
+      "point": [7.0, 6.5, 1.0],
+      "floor": "ground"
+    }
+  ]
+}

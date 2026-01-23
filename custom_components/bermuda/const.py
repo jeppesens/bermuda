@@ -194,6 +194,30 @@ DOCS[CONF_SMOOTHING_SAMPLES] = (
     " make for slower distance increases. 10 or 20 seems good."
 )
 
+# Trilateration configuration
+CONFDATA_SCANNER_POSITIONS = "scanner_positions"
+DOCS[CONFDATA_SCANNER_POSITIONS] = "Scanner (x,y,z) positions for trilateration"
+
+CONF_ENABLE_TRILATERATION, DEFAULT_ENABLE_TRILATERATION = "enable_trilateration", True
+DOCS[CONF_ENABLE_TRILATERATION] = "Enable trilateration/position calculation"
+
+CONF_MIN_TRILATERATION_SCANNERS, DEFAULT_MIN_TRILATERATION_SCANNERS = "min_trilateration_scanners", 2
+DOCS[CONF_MIN_TRILATERATION_SCANNERS] = "Minimum number of scanners required for position calculation"
+
+CONF_TRILATERATION_OVERRIDE_AREA, DEFAULT_TRILATERATION_OVERRIDE_AREA = "trilateration_override_area", True
+DOCS[CONF_TRILATERATION_OVERRIDE_AREA] = "Use trilateration position to override distance-based area assignment"
+
+CONF_TRILATERATION_AREA_MIN_CONFIDENCE, DEFAULT_TRILATERATION_AREA_MIN_CONFIDENCE = (
+    "trilateration_area_min_confidence",
+    30.0,
+)
+DOCS[CONF_TRILATERATION_AREA_MIN_CONFIDENCE] = (
+    "Minimum confidence percentage to use trilateration for area assignment"
+)
+
+TRILATERATION_POSITION_TIMEOUT = 30
+# seconds before marking a calculated position as stale
+
 # Defaults
 DEFAULT_NAME = DOMAIN
 
