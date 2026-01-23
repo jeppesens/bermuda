@@ -772,8 +772,23 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                     )
                     
                     if scanner_count >= min_scanners:
+                        _LOGGER.debug(
+                            "Device %s: Calling trilateration (scanners: %d >= %d)",
+                            device.name,
+                            scanner_count,
+                            min_scanners,
+                        )
                         result = calculate_position(device, nowstamp)
                         if result:
+                            _LOGGER.info(
+                                "Position calculated for %s: (%.2f, %.2f, %.2f) confidence=%.1f%% method=%s",
+                                device.name,
+                                result.x,
+                                result.y,
+                                result.z,
+                                result.confidence,
+                                result.method,
+                            )
                             device.calculated_position = (result.x, result.y, result.z)
                             device.position_confidence = result.confidence
                             device.position_timestamp = nowstamp
@@ -787,6 +802,13 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                 >= self.options.get(CONF_TRILATERATION_AREA_MIN_CONFIDENCE, 30.0)
                             ):
                                 from .trilateration import find_room_for_position
+                                
+                                _LOGGER.debug(
+                                    "Checking room for position (%.2f, %.2f, %.2f)",
+                                    result.x,
+                                    result.y,
+                                    result.z,
+                                )
 
                                 room_area_id = find_room_for_position(
                                     (result.x, result.y, result.z),
@@ -799,16 +821,28 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                     area = self.ar.async_get_area(room_area_id)
                                     if area:
                                         # Override the distance-based area assignment
+                                        old_area = device.area_name
                                         device.area_id = area.id
                                         device.area_name = area.name
                                         device.area = area
                                         device.area_icon = area.icon or device.area_icon
-                                        _LOGGER.debug(
-                                            "Device %s assigned to area %s via trilateration (confidence: %.1f%%)",
+                                        _LOGGER.info(
+                                            "Device %s area: %s → %s via trilateration (confidence: %.1f%%)",
                                             device.name,
+                                            old_area or "None",
                                             area.name,
                                             result.confidence,
                                         )
+                                    else:
+                                        _LOGGER.warning(
+                                            "Room area_id '%s' not found in Home Assistant Areas",
+                                            room_area_id,
+                                        )
+                                else:
+                                    _LOGGER.debug(
+                                        "Device %s position not in any defined room",
+                                        device.name,
+                                    )
 
             self._refresh_areas_by_min_distance()
 
