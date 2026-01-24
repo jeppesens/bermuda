@@ -63,6 +63,7 @@ from .const import CONF_UPDATE_INTERVAL
 from .const import CONFDATA_FLOORS
 from .const import CONFDATA_ROOMS
 from .const import CONFDATA_SCANNER_POSITIONS
+from .const import TRILATERATION_POSITION_TIMEOUT
 from .const import DEFAULT_ATTENUATION
 from .const import DEFAULT_DEVTRACK_TIMEOUT
 from .const import DEFAULT_MAX_RADIUS
@@ -860,7 +861,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 elif not self.options.get(CONF_ENABLE_TRILATERATION, True):
                     _LOGGER.debug("Device %s: Trilateration disabled in options", device.name)
 
-            self._refresh_areas_by_min_distance()
+            self._refresh_areas_by_min_distance(nowstamp)
 
             # We might need to freshen deliberately on first start if no new scanners
             # were discovered in the first scan update. This is likely if nothing has changed
@@ -1431,7 +1432,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             return getattr(areas, "name", "invalid_area")
         return None
 
-    def _refresh_areas_by_min_distance(self):
+    def _refresh_areas_by_min_distance(self, nowstamp: float):
         """Set area for ALL devices based on closest beacon."""
         for device in self.devices.values():
             if (
@@ -1439,6 +1440,29 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 device.create_sensor  # include any devices we are tracking
                 # or device.metadevice_type in METADEVICE_SOURCETYPES  # and any source devices for PBLE, ibeacon etc
             ):
+                # Skip devices with fresh trilateration positions when override is enabled
+                if (
+                    self.options.get(CONF_TRILATERATION_OVERRIDE_AREA, True)
+                    and device.position_timestamp is not None
+                    and device.calculated_position is not None
+                    and device.area_id is not None
+                    and nowstamp - device.position_timestamp <= TRILATERATION_POSITION_TIMEOUT
+                ):
+                    _LOGGER.debug(
+                        "Device %s: Skipping min-distance area assignment - trilateration owns area (position age: %.1fs)",
+                        device.name,
+                        nowstamp - device.position_timestamp,
+                    )
+                    continue
+                
+                # Use min-distance for devices without trilateration or with stale positions
+                if device.position_timestamp is not None and nowstamp - device.position_timestamp > TRILATERATION_POSITION_TIMEOUT:
+                    _LOGGER.debug(
+                        "Device %s: Using min-distance - trilateration position stale (%.1fs old)",
+                        device.name,
+                        nowstamp - device.position_timestamp,
+                    )
+                
                 self._refresh_area_by_min_distance(device)
 
     @dataclass
