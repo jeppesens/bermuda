@@ -17,12 +17,10 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .const import (
-    _LOGGER,
-    CONF_MAX_VELOCITY,
-    DEFAULT_MAX_VELOCITY,
-    TRILATERATION_POSITION_TIMEOUT,
-)
+from .const import _LOGGER
+from .const import CONF_MAX_VELOCITY
+from .const import DEFAULT_MAX_VELOCITY
+from .const import TRILATERATION_POSITION_TIMEOUT
 
 if TYPE_CHECKING:
     from .bermuda_device import BermudaDevice
@@ -55,10 +53,10 @@ def calculate_position(
         TrilaterationResult with (x,y,z) position and confidence, or None if insufficient data
     """
     _LOGGER.info("=== TRILATERATION START for %s ===", device.name)
-    
+
     # Gather valid scanner positions and distances
     scanner_data: list[tuple[tuple[float, float, float], float]] = []
-    
+
     _LOGGER.debug("Checking %d adverts for device %s", len(device.adverts), device.name)
 
     for advert in device.adverts.values():
@@ -121,7 +119,7 @@ def calculate_position(
     else:  # 4+
         _LOGGER.info("Routing to %d-scanner overdetermined algorithm", scanner_count)
         result = _calculate_position_4plus_scanners(device, scanner_data, current_time)
-    
+
     if result:
         _LOGGER.info(
             "=== TRILATERATION SUCCESS for %s: (%.2f, %.2f, %.2f) confidence=%.1f%% method=%s ===",
@@ -134,7 +132,7 @@ def calculate_position(
         )
     else:
         _LOGGER.warning("=== TRILATERATION FAILED: Algorithm returned None for %s ===", device.name)
-    
+
     return result
 
 
@@ -149,7 +147,7 @@ def _calculate_position_1_scanner(
     Returns scanner position with low confidence.
     """
     (sx, sy, sz), distance = scanner_data[0]
-    
+
     _LOGGER.debug("1-scanner: Scanner at (%.2f, %.2f, %.2f), distance=%.2fm", sx, sy, sz, distance)
 
     # If we have previous position, maintain direction
@@ -161,7 +159,7 @@ def _calculate_position_1_scanner(
         dy = prev_y - sy
         dz = prev_z - sz
         prev_distance = math.sqrt(dx**2 + dy**2 + dz**2)
-        
+
         _LOGGER.debug("1-scanner: Previous distance from scanner: %.2fm", prev_distance)
 
         if prev_distance > 0.01:  # Avoid division by zero
@@ -170,7 +168,7 @@ def _calculate_position_1_scanner(
             x = sx + dx * scale
             y = sy + dy * scale
             z = sz + dz * scale
-            
+
             _LOGGER.info("1-scanner: Using directional method, result=(%.2f, %.2f, %.2f)", x, y, z)
 
             return TrilaterationResult(
@@ -206,7 +204,7 @@ def _calculate_position_2_scanners(
     """
     (s1x, s1y, s1z), d1 = scanner_data[0]
     (s2x, s2y, s2z), d2 = scanner_data[1]
-    
+
     _LOGGER.debug("2-scanner: Scanner1=(%.2f,%.2f,%.2f) d1=%.2fm", s1x, s1y, s1z, d1)
     _LOGGER.debug("2-scanner: Scanner2=(%.2f,%.2f,%.2f) d2=%.2fm", s2x, s2y, s2z, d2)
 
@@ -215,7 +213,7 @@ def _calculate_position_2_scanners(
     dy = s2y - s1y
     dz = s2z - s1z
     scanner_distance = math.sqrt(dx**2 + dy**2 + dz**2)
-    
+
     _LOGGER.debug("2-scanner: Distance between scanners: %.2fm", scanner_distance)
 
     if scanner_distance < 0.01:
@@ -256,27 +254,27 @@ def _calculate_position_2_scanners(
         # Numerical error - circles barely touch
         h_squared = 0
     h = math.sqrt(h_squared)
-    
+
     _LOGGER.debug("2-scanner: Intersection geometry - a=%.2f, h=%.2f", a, h)
 
     # Midpoint along line from scanner1 to scanner2
     mid_x = s1x + (dx * a / scanner_distance)
     mid_y = s1y + (dy * a / scanner_distance)
     mid_z = s1z + (dz * a / scanner_distance)
-    
+
     _LOGGER.debug("2-scanner: Midpoint=(%.2f, %.2f, %.2f)", mid_x, mid_y, mid_z)
 
     # Two intersection points perpendicular to scanner line
     # We need a perpendicular vector in 3D space
     # Use cross product with "up" vector, unless scanners are vertical
     up_vec = (0, 0, 1) if abs(dz) < scanner_distance * 0.9 else (0, 1, 0)
-    
+
     # Cross product for perpendicular direction
     perp_x = dy * up_vec[2] - dz * up_vec[1]
     perp_y = dz * up_vec[0] - dx * up_vec[2]
     perp_z = dx * up_vec[1] - dy * up_vec[0]
     perp_length = math.sqrt(perp_x**2 + perp_y**2 + perp_z**2)
-    
+
     if perp_length < 0.01:
         # Degenerate case - use different up vector
         up_vec = (1, 0, 0)
@@ -298,7 +296,7 @@ def _calculate_position_2_scanners(
     pos2_x = mid_x - perp_x * h
     pos2_y = mid_y - perp_y * h
     pos2_z = mid_z - perp_z * h
-    
+
     _LOGGER.debug("2-scanner: Candidate 1=(%.2f, %.2f, %.2f)", pos1_x, pos1_y, pos1_z)
     _LOGGER.debug("2-scanner: Candidate 2=(%.2f, %.2f, %.2f)", pos2_x, pos2_y, pos2_z)
 
@@ -308,7 +306,7 @@ def _calculate_position_2_scanners(
 
     if device.calculated_position is not None and device.position_timestamp is not None:
         prev_x, prev_y, prev_z = device.calculated_position
-        
+
         # Calculate distance to each candidate
         dist1 = math.sqrt((pos1_x - prev_x)**2 + (pos1_y - prev_y)**2 + (pos1_z - prev_z)**2)
         dist2 = math.sqrt((pos2_x - prev_x)**2 + (pos2_y - prev_y)**2 + (pos2_z - prev_z)**2)
@@ -317,7 +315,7 @@ def _calculate_position_2_scanners(
         time_delta = current_time - device.position_timestamp
         max_velocity = device.options.get(CONF_MAX_VELOCITY, DEFAULT_MAX_VELOCITY)
         max_movement = max_velocity * time_delta if time_delta > 0 else float("inf")
-        
+
         _LOGGER.debug("2-scanner: Previous position=(%.2f, %.2f, %.2f)", prev_x, prev_y, prev_z)
         _LOGGER.debug("2-scanner: Distance to candidate1=%.2fm, candidate2=%.2fm", dist1, dist2)
         _LOGGER.debug(
@@ -393,12 +391,12 @@ def _weighted_centroid(
     Calculate position using weighted centroid algorithm.
 
     Weight = 1 / (distance^2 + epsilon)
-    
+
     This gives higher weight to closer scanners, which typically have
     more accurate distance measurements.
     """
     _LOGGER.debug("Weighted centroid: Using %d scanners, method=%s", scanner_count, method)
-    
+
     epsilon = 0.1  # Prevent division by zero
 
     total_weight = 0.0
@@ -412,7 +410,7 @@ def _weighted_centroid(
         weighted_y += sy * weight
         weighted_z += sz * weight
         total_weight += weight
-        
+
         _LOGGER.debug(
             "  Scanner %d: pos=(%.2f,%.2f,%.2f) dist=%.2fm weight=%.4f",
             i,
@@ -426,7 +424,7 @@ def _weighted_centroid(
     x = weighted_x / total_weight
     y = weighted_y / total_weight
     z = weighted_z / total_weight
-    
+
     _LOGGER.info(
         "Weighted centroid: Result=(%.2f, %.2f, %.2f) total_weight=%.4f",
         x,
@@ -438,13 +436,13 @@ def _weighted_centroid(
     # Calculate confidence based on scanner count and variance
     # More scanners = higher confidence
     base_confidence = min(50 + (scanner_count - 2) * 15, 95)
-    
+
     # Reduce confidence if distances are very different (high variance)
     distances = [d for _, d in scanner_data]
     avg_distance = sum(distances) / len(distances)
     variance = sum((d - avg_distance)**2 for d in distances) / len(distances)
     std_dev = math.sqrt(variance)
-    
+
     # Reduce confidence if standard deviation is high relative to average
     if avg_distance > 0:
         variance_penalty = min((std_dev / avg_distance) * 20, 30)

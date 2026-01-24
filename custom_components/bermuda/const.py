@@ -198,6 +198,15 @@ DOCS[CONF_SMOOTHING_SAMPLES] = (
 CONFDATA_SCANNER_POSITIONS = "scanner_positions"
 DOCS[CONFDATA_SCANNER_POSITIONS] = "Scanner (x,y,z) positions for trilateration"
 
+CONFDATA_FLOORS = "floors"
+DOCS[CONFDATA_FLOORS] = "Floor definitions with bounds for trilateration"
+
+CONFDATA_ROOMS = "rooms"
+DOCS[CONFDATA_ROOMS] = "Room polygon definitions for zone detection"
+
+CONF_JSON_IMPORT = "json_import"
+CONF_IMPORT_MODE = "import_mode"
+
 CONF_ENABLE_TRILATERATION, DEFAULT_ENABLE_TRILATERATION = "enable_trilateration", True
 DOCS[CONF_ENABLE_TRILATERATION] = "Enable trilateration/position calculation"
 

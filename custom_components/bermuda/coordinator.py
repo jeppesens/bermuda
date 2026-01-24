@@ -5,8 +5,10 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, cast
+from datetime import datetime
+from datetime import timedelta
+from typing import TYPE_CHECKING
+from typing import cast
 
 import aiofiles
 import voluptuous as vol
@@ -18,94 +20,79 @@ from homeassistant.components.bluetooth.api import _get_manager
 from homeassistant.const import MAJOR_VERSION as HA_VERSION_MAJ
 from homeassistant.const import MINOR_VERSION as HA_VERSION_MIN
 from homeassistant.const import Platform
-from homeassistant.core import (
-    Event,
-    HomeAssistant,
-    ServiceCall,
-    ServiceResponse,
-    SupportsResponse,
-    callback,
-)
-from homeassistant.helpers import (
-    area_registry as ar,
-)
-from homeassistant.helpers import (
-    config_validation as cv,
-)
-from homeassistant.helpers import (
-    device_registry as dr,
-)
-from homeassistant.helpers import (
-    entity_registry as er,
-)
-from homeassistant.helpers import (
-    floor_registry as fr,
-)
-from homeassistant.helpers import (
-    issue_registry as ir,
-)
-from homeassistant.helpers.device_registry import (
-    EVENT_DEVICE_REGISTRY_UPDATED,
-    EventDeviceRegistryUpdatedData,
-)
+from homeassistant.core import Event
+from homeassistant.core import HomeAssistant
+from homeassistant.core import ServiceCall
+from homeassistant.core import ServiceResponse
+from homeassistant.core import SupportsResponse
+from homeassistant.core import callback
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import floor_registry as fr
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.device_registry import EVENT_DEVICE_REGISTRY_UPDATED
+from homeassistant.helpers.device_registry import EventDeviceRegistryUpdatedData
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.util.dt import get_age, now
+from homeassistant.util.dt import get_age
+from homeassistant.util.dt import now
 
 from .bermuda_device import BermudaDevice
 from .bermuda_irk import BermudaIrkManager
+from .const import _LOGGER
+from .const import _LOGGER_SPAM_LESS
+from .const import ADDR_TYPE_PRIVATE_BLE_DEVICE
+from .const import AREA_MAX_AD_AGE
+from .const import BDADDR_TYPE_NOT_MAC48
+from .const import BDADDR_TYPE_RANDOM_RESOLVABLE
+from .const import CONF_ATTENUATION
+from .const import CONF_DEVICES
+from .const import CONF_DEVTRACK_TIMEOUT
+from .const import CONF_ENABLE_TRILATERATION
+from .const import CONF_MAX_RADIUS
+from .const import CONF_MAX_VELOCITY
+from .const import CONF_MIN_TRILATERATION_SCANNERS
+from .const import CONF_REF_POWER
+from .const import CONF_RSSI_OFFSETS
+from .const import CONF_SMOOTHING_SAMPLES
+from .const import CONF_TRILATERATION_AREA_MIN_CONFIDENCE
+from .const import CONF_TRILATERATION_OVERRIDE_AREA
+from .const import CONF_UPDATE_INTERVAL
+from .const import CONFDATA_FLOORS
+from .const import CONFDATA_ROOMS
+from .const import CONFDATA_SCANNER_POSITIONS
+from .const import DEFAULT_ATTENUATION
+from .const import DEFAULT_DEVTRACK_TIMEOUT
+from .const import DEFAULT_MAX_RADIUS
+from .const import DEFAULT_MAX_VELOCITY
+from .const import DEFAULT_REF_POWER
+from .const import DEFAULT_SMOOTHING_SAMPLES
+from .const import DEFAULT_UPDATE_INTERVAL
+from .const import DOMAIN
+from .const import DOMAIN_PRIVATE_BLE_DEVICE
+from .const import METADEVICE_IBEACON_DEVICE
+from .const import METADEVICE_TYPE_IBEACON_SOURCE
+from .const import METADEVICE_TYPE_PRIVATE_BLE_SOURCE
+from .const import PRUNE_MAX_COUNT
+from .const import PRUNE_TIME_DEFAULT
+from .const import PRUNE_TIME_INTERVAL
+from .const import PRUNE_TIME_KNOWN_IRK
+from .const import PRUNE_TIME_REDACTIONS
+from .const import PRUNE_TIME_UNKNOWN_IRK
+from .const import REPAIR_SCANNER_WITHOUT_AREA
+from .const import SAVEOUT_COOLDOWN
+from .const import SIGNAL_DEVICE_NEW
+from .const import SIGNAL_SCANNERS_CHANGED
+from .const import UPDATE_INTERVAL
 from .trilateration import calculate_position
-from .const import (
-    _LOGGER,
-    _LOGGER_SPAM_LESS,
-    ADDR_TYPE_PRIVATE_BLE_DEVICE,
-    AREA_MAX_AD_AGE,
-    BDADDR_TYPE_NOT_MAC48,
-    BDADDR_TYPE_RANDOM_RESOLVABLE,
-    CONF_ATTENUATION,
-    CONF_DEVICES,
-    CONF_DEVTRACK_TIMEOUT,
-    CONF_ENABLE_TRILATERATION,
-    CONF_MAX_RADIUS,
-    CONF_MAX_VELOCITY,
-    CONF_MIN_TRILATERATION_SCANNERS,
-    CONF_REF_POWER,
-    CONF_RSSI_OFFSETS,
-    CONF_SMOOTHING_SAMPLES,
-    CONF_TRILATERATION_AREA_MIN_CONFIDENCE,
-    CONF_TRILATERATION_OVERRIDE_AREA,
-    CONF_UPDATE_INTERVAL,
-    DEFAULT_ATTENUATION,
-    DEFAULT_DEVTRACK_TIMEOUT,
-    DEFAULT_MAX_RADIUS,
-    DEFAULT_MAX_VELOCITY,
-    DEFAULT_REF_POWER,
-    DEFAULT_SMOOTHING_SAMPLES,
-    DEFAULT_UPDATE_INTERVAL,
-    DOMAIN,
-    DOMAIN_PRIVATE_BLE_DEVICE,
-    METADEVICE_IBEACON_DEVICE,
-    METADEVICE_TYPE_IBEACON_SOURCE,
-    METADEVICE_TYPE_PRIVATE_BLE_SOURCE,
-    PRUNE_MAX_COUNT,
-    PRUNE_TIME_DEFAULT,
-    PRUNE_TIME_INTERVAL,
-    PRUNE_TIME_KNOWN_IRK,
-    PRUNE_TIME_REDACTIONS,
-    PRUNE_TIME_UNKNOWN_IRK,
-    REPAIR_SCANNER_WITHOUT_AREA,
-    SAVEOUT_COOLDOWN,
-    SIGNAL_DEVICE_NEW,
-    SIGNAL_SCANNERS_CHANGED,
-    UPDATE_INTERVAL,
-)
-from .util import mac_explode_formats, mac_norm
+from .util import mac_explode_formats
+from .util import mac_norm
 
 if TYPE_CHECKING:
     from habluetooth import BluetoothServiceInfoBleak
-    from homeassistant.components.bluetooth import (
-        BluetoothChange,
-    )
+    from homeassistant.components.bluetooth import BluetoothChange
     from homeassistant.components.bluetooth.manager import HomeAssistantBluetoothManager
 
     from . import BermudaConfigEntry
@@ -172,6 +159,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         self.stamp_last_update: float = 0  # Last time we ran an update, from monotonic_time_coarse()
         self.stamp_last_update_started: float = 0
         self.stamp_last_prune: float = 0  # When we last pruned device list
+        self.stamp_last_position_load: float = 0  # Track when scanner positions were last loaded
 
         self.member_uuids = {}
         self.company_uuids = {}
@@ -189,8 +177,8 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         )
 
         self._manager: HomeAssistantBluetoothManager = _get_manager(hass)  # instance of the bluetooth manager
-        self._hascanners: set[BaseHaScanner] = set()  # Links to the backend scanners
-        self._hascanner_timestamps: dict[str, dict[str, float]] = {}  # scanner_address, device_address, stamp
+        self._ha_scanners: set[BaseHaScanner] = set()  # Links to the backend scanners
+        self._ha_scanner_timestamps: dict[str, dict[str, float]] = {}  # scanner_address, device_address, stamp
         self._scanner_list: set[str] = set()
         self._scanners: set[BermudaDevice] = set()  # Set of all in self.devices that is_scanner=True
         self.irk_manager = BermudaIrkManager()
@@ -273,6 +261,9 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                     CONF_REF_POWER,
                     CONF_SMOOTHING_SAMPLES,
                     CONF_RSSI_OFFSETS,
+                    CONFDATA_SCANNER_POSITIONS,
+                    CONFDATA_FLOORS,
+                    CONFDATA_ROOMS,
                 ):
                     self.options[key] = val
 
@@ -408,92 +399,64 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             # Ensure that an issue reading these files (which are optional, really) doesn't stop the whole show.
             self._waitingfor_load_manufacturer_ids = False
 
-    async def async_load_scanner_positions(self):
-        """Load scanner positions from JSON file for trilateration."""
-        try:
-            import json
-            from pathlib import Path
+    def load_scanner_positions(self):
+        """Load scanner positions from config entry for trilateration."""
+        _LOGGER.info("=== LOADING SCANNER POSITIONS ===")
+        _LOGGER.debug("Current devices in Bermuda: %s", list(self.devices.keys()))
+        _LOGGER.debug("Current scanners: %s", [d.address for d in self.get_scanners])
+        _LOGGER.info(
+            "Scanner states: %s",
+            {addr: f"is_scanner={dev.is_scanner}, has_position={dev.position is not None}"
+             for addr, dev in self.devices.items() if dev.is_scanner or dev.position is not None}
+        )
 
-            # Try multiple locations for the scanner_positions.json file
-            # 1. Config directory
-            config_path = Path(self.hass.config.config_dir) / "scanner_positions.json"
-            # 2. Custom components directory
-            custom_path = Path(__file__).parent / "scanner_positions.json"
+        positions_loaded = 0
 
-            file_path = None
-            if config_path.exists():
-                file_path = config_path
-            elif custom_path.exists():
-                file_path = custom_path
+        # First, load from config entry if available
+        config_floors = self.options.get(CONFDATA_FLOORS, [])
+        config_rooms = self.options.get(CONFDATA_ROOMS, [])
+        config_positions = self.options.get(CONFDATA_SCANNER_POSITIONS, {})
 
-            if file_path is None:
-                _LOGGER.debug("No scanner_positions.json file found - trilateration disabled")
-                return
+        # Load floors from config entry
+        for floor in config_floors:
+            self.map_floors[floor["id"]] = floor
+            _LOGGER.info("Loaded floor from config: %s (%s)", floor["id"], floor.get("name"))
 
-            async with aiofiles.open(file_path) as f:
-                content = await f.read()
-                data = json.loads(content)
+        # Load rooms from config entry
+        for room in config_rooms:
+            self.map_rooms[room["id"]] = room
+            _LOGGER.info(
+                "Loaded room from config: %s (%s) with %d vertices",
+                room["id"],
+                room.get("name"),
+                len(room.get("points", [])),
+            )
 
-            # Load floors
-            for floor in data.get("floors", []):
-                self.map_floors[floor["id"]] = floor
-                _LOGGER.debug("Loaded floor: %s (%s)", floor["id"], floor.get("name"))
-
-            # Load rooms
-            for room in data.get("rooms", []):
-                self.map_rooms[room["id"]] = room
-                _LOGGER.debug(
-                    "Loaded room: %s (%s) with %d vertices",
-                    room["id"],
-                    room.get("name"),
-                    len(room.get("points", [])),
+        # Apply scanner positions from config entry
+        for m, pos_data in config_positions.items():
+            mac = mac_norm(m)  # Normalize MAC address
+            if mac in self.devices and self.devices[mac].is_scanner:
+                self.devices[mac].position = tuple(pos_data["point"])
+                positions_loaded += 1
+                _LOGGER.info(
+                    "  ✓ Loaded position from config for scanner %s (%s): (%.2f, %.2f, %.2f)",
+                    pos_data.get("name", mac),
+                    mac,
+                    pos_data["point"][0],
+                    pos_data["point"][1],
+                    pos_data["point"][2],
                 )
 
-            # Parse and apply scanner positions
-            positions_loaded = 0
-            for node in data.get("nodes", []):
-                node_id = mac_norm(node["id"])  # Normalize MAC address
-                point = node.get("point")
+        if positions_loaded > 0:
+            _LOGGER.info("✓ Loaded %d scanner positions for trilateration", positions_loaded)
+        else:
+            _LOGGER.warning("✗ No valid scanner positions loaded")
+            _LOGGER.warning("  Use the 'Bulk Import Map & Scanners' option to configure positions")
 
-                if not point or len(point) != 3:
-                    _LOGGER.warning("Invalid position for scanner %s: %s", node_id, point)
-                    continue
-
-                # Find the scanner device and assign position
-                if node_id in self.devices:
-                    device = self.devices[node_id]
-                    if device.is_scanner:
-                        device.position = (float(point[0]), float(point[1]), float(point[2]))
-                        positions_loaded += 1
-                        _LOGGER.info(
-                            "Loaded position for scanner %s (%s): (%.2f, %.2f, %.2f)",
-                            node.get("name", node_id),
-                            node_id,
-                            point[0],
-                            point[1],
-                            point[2],
-                        )
-                    else:
-                        _LOGGER.warning("Device %s is not a scanner, skipping position assignment", node_id)
-                else:
-                    _LOGGER.debug("Scanner %s not found in devices yet, will retry on next update", node_id)
-
-            if positions_loaded > 0:
-                _LOGGER.info("Loaded %d scanner positions for trilateration", positions_loaded)
-            else:
-                _LOGGER.warning("No valid scanner positions loaded from %s", file_path)
-
-            if len(self.map_rooms) > 0:
-                _LOGGER.info("Loaded %d rooms for zone detection", len(self.map_rooms))
-            if len(self.map_floors) > 0:
-                _LOGGER.info("Loaded %d floors", len(self.map_floors))
-
-        except FileNotFoundError:
-            _LOGGER.debug("scanner_positions.json not found - trilateration will be disabled")
-        except json.JSONDecodeError as err:
-            _LOGGER.error("Failed to parse scanner_positions.json: %s", err)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.exception("Unexpected error loading scanner positions: %s", err)
+        if len(self.map_rooms) > 0:
+            _LOGGER.info("✓ Loaded %d rooms for zone detection", len(self.map_rooms))
+        if len(self.map_floors) > 0:
+            _LOGGER.info("✓ Loaded %d floors", len(self.map_floors))
 
     @callback
     def handle_devreg_changes(self, ev: Event[EventDeviceRegistryUpdatedData]):
@@ -756,21 +719,62 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 # Recalculate smoothed distances, last_seen etc
                 device.calculate_data()
 
-                # Calculate trilateration position if enabled and device is tracked
                 if device.create_sensor and self.options.get(CONF_ENABLE_TRILATERATION, True):
-                    min_scanners = self.options.get(CONF_MIN_TRILATERATION_SCANNERS, 2)
-                    
-                    # Count scanners with valid positions and distances
-                    scanner_count = sum(
-                        1
-                        for advert in device.adverts.values()
-                        if (scanner := self.devices.get(advert.scanner_address))
-                        and scanner.is_scanner
-                        and scanner.position is not None
-                        and advert.rssi_distance is not None
-                        and advert.rssi_distance > 0
+                    # Calculate trilateration position if enabled and device is tracked
+                    _LOGGER.debug(
+                        "Device %s: create_sensor=%s, trilat_enabled=%s",
+                        device.name,
+                        device.create_sensor,
+                        self.options.get(CONF_ENABLE_TRILATERATION, True),
                     )
-                    
+                    min_scanners = self.options.get(CONF_MIN_TRILATERATION_SCANNERS, 2)
+
+                    # Count scanners with valid positions and distances
+                    _LOGGER.debug(
+                        "Counting valid scanners for device %s (has %d adverts)",
+                        device.name,
+                        len(device.adverts),
+                    )
+
+                    scanner_count = 0
+                    for advert in device.adverts.values():
+                        scanner = self.devices.get(advert.scanner_address)
+
+                        # Log each advert check
+                        if scanner is None:
+                            _LOGGER.debug("  - %s: Scanner not in devices", advert.scanner_address)
+                            continue
+                        if not scanner.is_scanner:
+                            _LOGGER.debug("  - %s: Not marked as scanner", scanner.name)
+                            continue
+                        if scanner.position is None:
+                            _LOGGER.debug("  - %s: No position configured for MAC %s", scanner.name, scanner.address)
+                            continue
+                        if advert.rssi_distance is None:
+                            _LOGGER.debug(
+                                "  - %s: rssi_distance is None (rssi=%.1f)",
+                                scanner.name,
+                                getattr(advert, "rssi", 0),
+                            )
+                            continue
+                        if advert.rssi_distance <= 0:
+                            _LOGGER.debug(
+                                "  - %s: rssi_distance <= 0 (%.2f)",
+                                scanner.name,
+                                advert.rssi_distance,
+                            )
+                            continue
+
+                        # This scanner is valid!
+                        scanner_count += 1
+                        _LOGGER.info(
+                            "  \u2713 %s: position=%s, distance=%.2fm, rssi=%.1f",
+                            scanner.name,
+                            scanner.position,
+                            advert.rssi_distance,
+                            getattr(advert, "rssi", 0),
+                        )
+
                     if scanner_count >= min_scanners:
                         _LOGGER.debug(
                             "Device %s: Calling trilateration (scanners: %d >= %d)",
@@ -793,7 +797,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                             device.position_confidence = result.confidence
                             device.position_timestamp = nowstamp
                             device.position_method = result.method
-                            
+
                             # Determine room from position and override area assignment if enabled
                             if (
                                 self.map_rooms
@@ -802,7 +806,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                 >= self.options.get(CONF_TRILATERATION_AREA_MIN_CONFIDENCE, 30.0)
                             ):
                                 from .trilateration import find_room_for_position
-                                
+
                                 _LOGGER.debug(
                                     "Checking room for position (%.2f, %.2f, %.2f)",
                                     result.x,
@@ -843,6 +847,18 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                         "Device %s position not in any defined room",
                                         device.name,
                                     )
+                    else:
+                        _LOGGER.debug(
+                            "Device %s: Trilateration skipped - insufficient scanners (%d < %d)",
+                            device.name,
+                            scanner_count,
+                            min_scanners,
+                        )
+                elif not device.create_sensor:
+                    # _LOGGER.debug("Device %s: Not tracked (create_sensor=False)", device.name)
+                    pass
+                elif not self.options.get(CONF_ENABLE_TRILATERATION, True):
+                    _LOGGER.debug("Device %s: Trilateration disabled in options", device.name)
 
             self._refresh_areas_by_min_distance()
 
@@ -902,19 +918,10 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
         # Initialise ha_scanners if we haven't already
         if self._scanner_init_pending:
+            _LOGGER.debug("Scanner init pending, calling _refresh_scanners")
             self._refresh_scanners(force=True)
 
-        # Load scanner positions from JSON file (only once, after first scanner init)
-        if not self._scanner_positions_loaded and not self._scanner_init_pending:
-            self.config_entry.async_create_background_task(
-                self.hass,
-                self.async_load_scanner_positions(),
-                "Load scanner positions",
-                eager_start=True,
-            )
-            self._scanner_positions_loaded = True
-
-        for ha_scanner in self._hascanners:
+        for ha_scanner in self._ha_scanners:
             # Create / Get the BermudaDevice for this scanner
             scanner_device = self._get_device(ha_scanner.source)
 
@@ -1690,12 +1697,15 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # Using new API in 2025.2
         _new_ha_scanners = set(self._manager.async_current_scanners())
 
-        if _new_ha_scanners is self._hascanners or _new_ha_scanners == self._hascanners:
-            # No changes.
+        if _new_ha_scanners is self._ha_scanners or _new_ha_scanners == self._ha_scanners:
+            # No changes, but if we're in init phase, mark as complete
+            if self._scanner_init_pending:
+                _LOGGER.info("Scanner initialization complete (no changes detected), enabling position loading")
+                self._scanner_init_pending = False
             return
 
         _LOGGER.debug("HA Base Scanner Set has changed, rebuilding.")
-        self._hascanners = _new_ha_scanners
+        self._ha_scanners = _new_ha_scanners
 
         self._async_purge_removed_scanners()
 
@@ -1705,19 +1715,32 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # Find active HaBaseScanners in the backend and treat that as our
         # authoritative source of truth.
         #
-        for hascanner in self._hascanners:
+        for hascanner in self._ha_scanners:
             scanner_address = mac_norm(hascanner.source)
             bermuda_scanner = self._get_or_create_device(scanner_address)
             bermuda_scanner.async_as_scanner_init(hascanner)
 
             if bermuda_scanner.area_id is None:
                 _scanners_without_areas.append(f"{bermuda_scanner.name} [{bermuda_scanner.address}]")
+        # TODO: map to area from the map, to not give false positives
         self._async_manage_repair_scanners_without_areas(_scanners_without_areas)
+
+        # Mark scanner initialization as complete
+        if self._scanner_init_pending:
+            _LOGGER.info("Scanner initialization complete, enabling position loading")
+            self._scanner_init_pending = False
+
+        # Load scanner positions after scanner list changes (always reload to catch new scanners)
+        nowstamp = monotonic_time_coarse()
+        _LOGGER.info("Loading scanner positions after scanner list rebuild")
+        self.load_scanner_positions()
+        self._scanner_positions_loaded = True
+        self.stamp_last_position_load = nowstamp
 
     def _async_purge_removed_scanners(self):
         """Demotes any devices that are no longer scanners based on new self.hascanners."""
         _scanners = [device.address for device in self.devices.values() if device.is_scanner]
-        for ha_scanner in self._hascanners:
+        for ha_scanner in self._ha_scanners:
             scanner_address = mac_norm(ha_scanner.source)
             if scanner_address in _scanners:
                 # This is still an extant HA Scanner, so we'll keep it.
