@@ -213,6 +213,28 @@ DOCS[CONF_ENABLE_TRILATERATION] = "Enable trilateration/position calculation"
 CONF_MIN_TRILATERATION_SCANNERS, DEFAULT_MIN_TRILATERATION_SCANNERS = "min_trilateration_scanners", 2
 DOCS[CONF_MIN_TRILATERATION_SCANNERS] = "Minimum number of scanners required for position calculation"
 
+CONF_MAX_TRILATERATION_SCANNERS, DEFAULT_MAX_TRILATERATION_SCANNERS = "max_trilateration_scanners", 8
+DOCS[CONF_MAX_TRILATERATION_SCANNERS] = "Maximum number of scanners to use for trilateration (closest scanners are used)"
+
+CONF_TRILATERATION_FILTER_COLINEAR, DEFAULT_TRILATERATION_FILTER_COLINEAR = "trilateration_filter_colinear", True
+DOCS[CONF_TRILATERATION_FILTER_COLINEAR] = "Filter out colinear scanners that create poor trilateration geometry"
+
+CONF_TRILATERATION_FLOOR_ATTENUATION, DEFAULT_TRILATERATION_FLOOR_ATTENUATION = (
+    "trilateration_floor_attenuation",
+    0.3,
+)
+DOCS[CONF_TRILATERATION_FLOOR_ATTENUATION] = (
+    "Weight reduction factor for scanners on different floors (0.0-1.0, lower = more penalty)"
+)
+
+CONF_TRILATERATION_WALL_ATTENUATION, DEFAULT_TRILATERATION_WALL_ATTENUATION = (
+    "trilateration_wall_attenuation",
+    0.7,
+)
+DOCS[CONF_TRILATERATION_WALL_ATTENUATION] = (
+    "Weight reduction factor for horizontal distance through walls per 5m segment (0.0-1.0)"
+)
+
 CONF_TRILATERATION_OVERRIDE_AREA, DEFAULT_TRILATERATION_OVERRIDE_AREA = "trilateration_override_area", True
 DOCS[CONF_TRILATERATION_OVERRIDE_AREA] = "Use trilateration position to override distance-based area assignment"
 

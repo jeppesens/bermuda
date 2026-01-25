@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -52,6 +53,7 @@ from .const import CONF_DEVICES
 from .const import CONF_DEVTRACK_TIMEOUT
 from .const import CONF_ENABLE_TRILATERATION
 from .const import CONF_MAX_RADIUS
+from .const import CONF_MAX_TRILATERATION_SCANNERS
 from .const import CONF_MAX_VELOCITY
 from .const import CONF_MIN_TRILATERATION_SCANNERS
 from .const import CONF_REF_POWER
@@ -66,6 +68,7 @@ from .const import CONFDATA_SCANNER_POSITIONS
 from .const import DEFAULT_ATTENUATION
 from .const import DEFAULT_DEVTRACK_TIMEOUT
 from .const import DEFAULT_MAX_RADIUS
+from .const import DEFAULT_MAX_TRILATERATION_SCANNERS
 from .const import DEFAULT_MAX_VELOCITY
 from .const import DEFAULT_REF_POWER
 from .const import DEFAULT_SMOOTHING_SAMPLES
@@ -740,10 +743,15 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                     )
 
                     # Validate scanners using shared helper (includes staleness check)
+                    max_scanners = self.options.get(
+                        CONF_MAX_TRILATERATION_SCANNERS,
+                        DEFAULT_MAX_TRILATERATION_SCANNERS,
+                    )
                     valid_scanners = validate_scanners_for_trilateration(
                         device,
                         nowstamp,
                         TRILATERATION_POSITION_TIMEOUT,
+                        max_scanners=max_scanners,
                     )
                     scanner_count = len(valid_scanners)
 
@@ -1341,13 +1349,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 # anything that isn't already set to something interesting, overwrite
                 # it with the new device's data.
                 for key, val in source_device.items():
-                    if val is any(
-                        [
-                            source_device.name_bt_local_name,
-                            source_device.name_bt_serviceinfo,
-                            source_device.manufacturer,
-                        ]
-                    ) and metadevice[key] in [None, False]:
+                    if val in [
+                        source_device.name_bt_local_name,
+                        source_device.name_bt_serviceinfo,
+                        source_device.manufacturer,
+                    ] and metadevice[key] in [None, False]:
                         metadevice[key] = val
                         _want_name_update = True
 
@@ -1357,15 +1363,13 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 # Anything that's VERY interesting, overwrite it regardless of what's already there:
                 # INTERESTING:
                 for key, val in source_device.items():
-                    if val is any(
-                        [
-                            source_device.beacon_major,
-                            source_device.beacon_minor,
-                            source_device.beacon_power,
-                            source_device.beacon_unique_id,
-                            source_device.beacon_uuid,
-                        ]
-                    ):
+                    if val in [
+                        source_device.beacon_major,
+                        source_device.beacon_minor,
+                        source_device.beacon_power,
+                        source_device.beacon_unique_id,
+                        source_device.beacon_uuid,
+                    ]:
                         metadevice[key] = val
                         # _want_name_update = True
             # Done iterating sources, remove any to be dropped
@@ -1506,7 +1510,17 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # if device.name in ("Ash Pixel IRK", "Garage", "Melinda iPhone"):
         #     _superchatty = True
 
-        for challenger in device.adverts.values():
+        # Sort scanners deterministically: freshest first, then strongest signal (lowest RSSI distance)
+        # This ensures consistent results regardless of dict iteration order
+        sorted_adverts = sorted(
+            device.adverts.values(),
+            key=lambda adv: (
+                -(adv.stamp if adv.stamp is not None else 0),  # Negative for descending (freshest first)
+                adv.rssi_distance if adv.rssi_distance is not None else float("inf"),  # Ascending (closest first)
+            ),
+        )
+
+        for challenger in sorted_adverts:
             # Check each scanner and any time one is found to be closer / better than
             # the existing closest_scanner, replace it. At the end we should have the
             # right one. In theory.
@@ -1621,9 +1635,11 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             pdiff_outright = 0.30  # Percentage difference to win outright / instantly
             pdiff_historical = 0.15  # Percentage difference required to win on historical test
             if len(challenger.hist_distance_by_interval) > min_history:  # we have enough history, let's go..
+                # Use islice for deque slicing (deques don't support [:N] notation)
+                from itertools import islice
                 tests.hist_min_max = (
-                    min(incumbent.hist_distance_by_interval[:history_window]),  # The closest that the incumbent has been
-                    max(challenger.hist_distance_by_interval[:history_window]),  # The **furthest** we have been in that time
+                    min(islice(incumbent.hist_distance_by_interval, 0, history_window)),  # The closest that the incumbent has been
+                    max(islice(challenger.hist_distance_by_interval, 0, history_window)),  # The **furthest** we have been in that time
                 )
                 if (
                     tests.hist_min_max[1] < tests.hist_min_max[0]
@@ -1650,6 +1666,25 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 tests.reason,
                 tests,
             )
+
+        # Debug log showing all scanner candidates and selection decision
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            scanner_summary = []
+            for adv in sorted_adverts[:5]:  # Show top 5 candidates
+                scanner = self.devices.get(adv.scanner_address)
+                if scanner and adv.rssi_distance is not None:
+                    age = nowstamp - adv.stamp if adv.stamp else 999
+                    status = "STALE" if age > AREA_MAX_AD_AGE else "fresh"
+                    status = "SELECTED" if adv is incumbent else status
+                    scanner_summary.append(
+                        f"{scanner.name}: {adv.rssi_distance:.1f}m @ {adv.rssi}dBm ({status}, {age:.1f}s old)"
+                    )
+            if scanner_summary:
+                _LOGGER.debug(
+                    "Device %s scanner candidates: %s",
+                    device.name,
+                    " | ".join(scanner_summary),
+                )
 
         _superchatty = False
 

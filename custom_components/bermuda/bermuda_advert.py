@@ -14,12 +14,15 @@ to the combination of the scanner and the device it is reporting.
 
 from __future__ import annotations
 
+from collections import deque
+from itertools import islice
 from typing import TYPE_CHECKING, Final
 
 from bluetooth_data_tools import monotonic_time_coarse
 
 from .const import (
     _LOGGER,
+    _LOGGER_SPAM_LESS,
     CONF_ATTENUATION,
     CONF_MAX_VELOCITY,
     CONF_REF_POWER,
@@ -30,7 +33,6 @@ from .const import (
     HIST_KEEP_COUNT,
 )
 
-# from .const import _LOGGER_SPAM_LESS
 from .util import clean_charbuf, rssi_to_metres
 
 if TYPE_CHECKING:
@@ -88,12 +90,13 @@ class BermudaAdvert(dict):
         self.rssi_distance: float | None = None
         self.rssi_distance_raw: float
         self.stale_update_count = 0  # How many times we did an update but no new stamps were found.
-        self.hist_stamp: list[float] = []
-        self.hist_rssi: list[int] = []
-        self.hist_distance: list[float] = []
-        self.hist_distance_by_interval: list[float] = []  # updated per-interval
-        self.hist_interval = []  # WARNING: This is actually "age of ad when we polled"
-        self.hist_velocity: list[float] = []  # Effective velocity versus previous stamped reading
+        # Using deques for O(1) prepend operations in rolling history buffers
+        self.hist_stamp: deque[float] = deque(maxlen=HIST_KEEP_COUNT)
+        self.hist_rssi: deque[int] = deque(maxlen=HIST_KEEP_COUNT)
+        self.hist_distance: deque[float] = deque(maxlen=HIST_KEEP_COUNT)
+        self.hist_distance_by_interval: deque[float] = deque(maxlen=HIST_KEEP_COUNT)  # updated per-interval
+        self.hist_interval: deque = deque(maxlen=HIST_KEEP_COUNT)  # WARNING: This is actually "age of ad when we polled"
+        self.hist_velocity: deque[float] = deque(maxlen=HIST_KEEP_COUNT)  # Effective velocity versus previous stamped reading
         self.conf_rssi_offset = self.options.get(CONF_RSSI_OFFSETS, {}).get(self.scanner_address, 0)
         self.conf_ref_power = self.options.get(CONF_REF_POWER)
         self.conf_attenuation = self.options.get(CONF_ATTENUATION)
@@ -144,7 +147,12 @@ class BermudaAdvert(dict):
 
             if new_stamp is None:
                 self.stale_update_count += 1
-                _LOGGER.debug("Advert from %s for %s lacks stamp, unexpected.", scanner.name, self._device.name)
+                _LOGGER_SPAM_LESS.warning(
+                    f"{scanner.name}_{self._device.name}_lacks_stamp",
+                    "Advert from %s for %s lacks stamp (scanner may not support timestamps)",
+                    scanner.name,
+                    self._device.name,
+                )
                 return
 
             if self.stamp > new_stamp:
@@ -181,7 +189,7 @@ class BermudaAdvert(dict):
             # and calculate the distance.
 
             self.rssi = advertisementdata.rssi
-            self.hist_rssi.insert(0, self.rssi)
+            self.hist_rssi.appendleft(self.rssi)
 
             self._update_raw_distance(reading_is_new=True)
 
@@ -198,10 +206,10 @@ class BermudaAdvert(dict):
                 _interval = new_stamp - self.stamp
             else:
                 _interval = None
-            self.hist_interval.insert(0, _interval)
+            self.hist_interval.appendleft(_interval)
 
             self.stamp = new_stamp or 0
-            self.hist_stamp.insert(0, self.stamp)
+            self.hist_stamp.appendleft(self.stamp)
 
         # if self.tx_power is not None and scandata.advertisement.tx_power != self.tx_power:
         #     # Not really an erorr, we just don't account for this happening -
@@ -284,7 +292,7 @@ class BermudaAdvert(dict):
         self.rssi_distance_raw = distance
         if reading_is_new:
             # Add a new historical reading
-            self.hist_distance.insert(0, distance)
+            self.hist_distance.appendleft(distance)
             # don't insert into hist_distance_by_interval, that's done by the caller.
         elif self.rssi_distance is not None:
             # We are over-riding readings between cycles.
@@ -410,7 +418,8 @@ class BermudaAdvert(dict):
                     peak_velocity = delta_d / delta_t
                 # if our initial reading is an approach, we are done here
                 if peak_velocity >= 0:
-                    for old_distance, old_stamp in zip(self.hist_distance[2:], self.hist_stamp[2:], strict=False):
+                    # Use islice for deque slicing (deques don't support [2:] notation)
+                    for old_distance, old_stamp in zip(islice(self.hist_distance, 2, None), islice(self.hist_stamp, 2, None), strict=False):
                         if old_stamp is None:
                             continue  # Skip this iteration if hist_stamp[i] is None
 
@@ -434,7 +443,7 @@ class BermudaAdvert(dict):
                 # There's no history, so no velocity
                 velocity = 0
 
-            self.hist_velocity.insert(0, velocity)
+            self.hist_velocity.appendleft(velocity)
 
             if velocity > self.conf_max_velocity:
                 if self._device.create_sensor:
@@ -446,16 +455,14 @@ class BermudaAdvert(dict):
 
                 # Discard the bogus reading by duplicating the last
                 if len(self.hist_distance_by_interval) > 0:
-                    self.hist_distance_by_interval.insert(0, self.hist_distance_by_interval[0])
+                    self.hist_distance_by_interval.appendleft(self.hist_distance_by_interval[0])
                 else:
                     # If nothing to duplicate, just plug in the raw distance.
-                    self.hist_distance_by_interval.insert(0, self.rssi_distance_raw)
+                    self.hist_distance_by_interval.appendleft(self.rssi_distance_raw)
             else:
-                self.hist_distance_by_interval.insert(0, self.rssi_distance_raw)
+                self.hist_distance_by_interval.appendleft(self.rssi_distance_raw)
 
-            # trim the log to length
-            if len(self.hist_distance_by_interval) > self.conf_smoothing_samples:
-                del self.hist_distance_by_interval[self.conf_smoothing_samples :]
+            # No need to trim - deque maxlen handles this automatically
 
             # Calculate a moving-window average, that only includes
             # historical values if they're "closer" (ie more reliable).
@@ -485,12 +492,8 @@ class BermudaAdvert(dict):
             else:
                 self.rssi_distance = self.rssi_distance_raw
 
-        # Trim our history lists
-        del self.hist_distance[HIST_KEEP_COUNT:]
-        del self.hist_interval[HIST_KEEP_COUNT:]
-        del self.hist_rssi[HIST_KEEP_COUNT:]
-        del self.hist_stamp[HIST_KEEP_COUNT:]
-        del self.hist_velocity[HIST_KEEP_COUNT:]
+        # Deques with maxlen auto-trim, no manual trimming needed for:
+        # hist_distance, hist_interval, hist_rssi, hist_stamp, hist_velocity, hist_distance_by_interval
 
     def to_dict(self):
         """Convert class to serialisable dict for dump_devices."""
