@@ -51,7 +51,13 @@ Bermuda now supports **trilateration** - calculating the precise (x, y, z) posit
 
 ### Setup:
 
-1. **Configure scanner positions and room boundaries**: Create a `scanner_positions.json` file in your Home Assistant config directory with the physical locations of your bluetooth proxies and room polygons:
+1. **Configure scanner positions and room boundaries**: Use the Bermuda integration's "Bulk Import Map & Scanners" feature to import scanner positions and room polygons:
+
+   a. Go to **Settings** → **Devices & Services** → **Bermuda BLE Trilateration**
+   
+   b. Click the **⋮ menu** (three dots) → **Bulk Import Map & Scanners**
+   
+   c. Paste JSON configuration with the physical locations of your bluetooth proxies and room polygons:
 
 ```json
 {
@@ -118,9 +124,11 @@ Bermuda now supports **trilateration** - calculating the precise (x, y, z) posit
 - x, y: horizontal position in meters
 - z: height above floor (typically 0.5-2.0 meters for wall-mounted proxies)
 
-2. **Restart Home Assistant** to load the scanner positions
+   d. Click **"Replace All"** (clears existing config) or **"Merge"** (adds to existing)
+   
+   e. Submit and reload the integration for changes to take effect
 
-3. **Enable the Position sensor** for your tracked devices in the entity settings (disabled by default until scanner positions are configured)
+2. **Enable the Position sensor** for your tracked devices in the entity settings (disabled by default until scanner positions are configured)
 
 ### Position Sensor:
 
@@ -154,7 +162,8 @@ This means your device's Area sensor will update based on precise position rathe
 - Use at least 3 proxies for reliable positioning
 - Define room polygons matching your Home Assistant Areas for automatic area detection
 - The `confidence` attribute helps you filter unreliable positions in automations
-- Example: `scanner_positions.json.example` is included in the Bermuda directory
+- **Export your config**: Use **⋮ menu** → **Export Map & Scanners (JSON)** to save a backup
+- **Use scanner_positions.json.example** as a template when creating your configuration
 
 See [the Wiki](https://github.com/agittins/bermuda/wiki/) for detailed setup guides and troubleshooting.
 

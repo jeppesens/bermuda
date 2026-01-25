@@ -108,6 +108,74 @@ def rssi_to_metres(rssi, ref_power=None, attenuation=None):
     return 10 ** ((ref_power - rssi) / (10 * attenuation))
 
 
+def validate_scanners_for_trilateration(
+    device,
+    current_time: float,
+    timeout: float,
+) -> list[tuple]:
+    """
+    Validate scanner adverts for a device and return valid scanner data.
+
+    Checks each advertisement for:
+    - Scanner exists and is marked as scanner
+    - Scanner has a configured position
+    - Distance is valid (not None and > 0)
+    - Advertisement is not stale (within timeout)
+
+    Args:
+        device: BermudaDevice to validate scanners for
+        current_time: Current timestamp for staleness check
+        timeout: Maximum age (seconds) for valid advertisements
+
+    Returns:
+        List of tuples: [(scanner, advert), ...] for valid scanners
+    """
+    from .const import _LOGGER
+
+    valid_scanners = []
+
+    for advert in device.adverts.values():
+        scanner = device._coordinator.devices.get(advert.scanner_address)
+
+        # Scanner must exist and be marked as scanner
+        if scanner is None or not scanner.is_scanner:
+            _LOGGER.debug("  - %s: Not a scanner, skipping", advert.scanner_address)
+            continue
+
+        # Scanner must have position configured
+        if scanner.position is None:
+            _LOGGER.debug("  - %s (%s): No position configured", scanner.name, advert.scanner_address)
+            continue
+
+        # Distance must be valid
+        if advert.rssi_distance is None or advert.rssi_distance <= 0:
+            _LOGGER.debug("  - %s: Invalid distance (%s)", scanner.name, advert.rssi_distance)
+            continue
+
+        # Advertisement must be recent (not stale)
+        advert_age = current_time - advert.stamp
+        if advert_age > timeout:
+            _LOGGER.debug(
+                "  - %s: Stale advert (%.1fs old, max %.1fs)",
+                scanner.name,
+                advert_age,
+                timeout,
+            )
+            continue
+
+        # This scanner is valid!
+        valid_scanners.append((scanner, advert))
+        _LOGGER.debug(
+            "  ✓ %s: pos=%s dist=%.2fm age=%.1fs",
+            scanner.name,
+            scanner.position,
+            advert.rssi_distance,
+            advert_age,
+        )
+
+    return valid_scanners
+
+
 @lru_cache(256)
 def clean_charbuf(instring: str | None) -> str:
     """

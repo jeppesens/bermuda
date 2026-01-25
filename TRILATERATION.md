@@ -55,9 +55,14 @@ You need to assign (x, y, z) coordinates to each bluetooth proxy. Choose a coord
 
 Alternatively, use the `bermuda.dump_devices` service and look for devices with `is_scanner: true`.
 
-### Step 3: Create scanner_positions.json
+### Step 3: Import Scanner Positions via UI
 
-Create a file named `scanner_positions.json` in your Home Assistant config directory (the same directory that contains `configuration.yaml`).
+Navigate to the Bermuda integration's bulk import feature:
+
+1. Go to **Settings** → **Devices & Services** → **Bermuda BLE Trilateration**
+2. Click the **⋮ menu** (three dots in top right)
+3. Select **"Bulk Import Map & Scanners"**
+4. **Paste your JSON configuration** into the text field
 
 **Format:**
 ```json
@@ -92,10 +97,19 @@ Create a file named `scanner_positions.json` in your Home Assistant config direc
 - Use `00:00:00:00:00:00` format (colons, not dashes or underscores)
 - All three coordinates (x, y, z) are always required
 - Typical proxy heights: 0.5m-2.0m above floor
+- See `scanner_positions.json.example` for a complete format example
 
-### Step 4: Restart Home Assistant
+5. Choose **"Replace All"** (removes existing positions) or **"Merge"** (adds to existing)
+6. Click **Submit**
 
-After creating `scanner_positions.json`, restart Home Assistant to load the scanner positions.
+### Step 4: Reload the Integration
+
+After importing scanner positions, reload the integration to apply changes:
+
+1. Go to **Settings** → **Devices & Services** → **Bermuda BLE Trilateration**
+2. Click the **⋮ menu** → **Reload**
+
+Alternatively, restart Home Assistant.
 
 Check the logs for confirmation:
 ```
@@ -165,7 +179,7 @@ bermuda:
 ### Position sensor shows "unknown" or "unavailable"
 
 **Possible causes:**
-1. `scanner_positions.json` not found or invalid JSON
+1. Scanner positions not imported or invalid JSON format
 2. Scanner MAC addresses don't match (check capitalization, format)
 3. Not enough scanners with valid distances (check distance sensors)
 4. Trilateration disabled in configuration
@@ -173,6 +187,7 @@ bermuda:
 **Solutions:**
 - Check HA logs for "Loaded X scanner positions" message
 - Verify MAC addresses match exactly using `bermuda.dump_devices`
+- Re-import scanner positions via **Bulk Import Map & Scanners** menu
 - Ensure scanners have valid distance measurements to the device
 - Enable debug logging: `custom_components.bermuda: debug`
 

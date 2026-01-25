@@ -24,6 +24,7 @@ from .const import SIGNAL_DEVICE_NEW
 from .const import SIGNAL_SCANNERS_CHANGED
 from .entity import BermudaEntity
 from .entity import BermudaGlobalEntity
+from .trilateration import find_room_for_position
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -596,7 +597,8 @@ class BermudaVisibleDeviceCount(BermudaGlobalSensor):
 class BermudaSensorPosition(BermudaSensor):
     """Position sensor showing trilateration-calculated (x, y, z) coordinates."""
 
-    _attr_state_class = SensorStateClass.MEASUREMENT
+    # No state_class since the state is a string representation of coordinates
+    # Individual x, y, z values are available in extra_state_attributes
     _attr_icon = "mdi:map-marker"
 
     @property
@@ -665,7 +667,6 @@ class BermudaSensorPosition(BermudaSensor):
 
             # Recalculate only if we have no cached room info or the position changed
             if cached_position != current_position or room_id is None:
-                from .trilateration import find_room_for_position
 
                 room_id = find_room_for_position(
                     current_position,

@@ -1,4 +1,11 @@
 {
+    "_comment": "This is an EXAMPLE file showing the JSON format for Bermuda scanner positions and room definitions.",
+    "_comment2": "This file is NOT automatically loaded by Bermuda. To use this configuration:",
+    "_comment3": "1. Copy the contents of this file",
+    "_comment4": "2. Go to Settings → Devices & Services → Bermuda BLE Trilateration",
+    "_comment5": "3. Click the menu (⋮) → 'Bulk Import Map & Scanners'",
+    "_comment6": "4. Paste the JSON into the text field and submit",
+    "_comment7": "Note: Remove these _comment fields when creating your actual configuration.",
     "floors": [
         {
             "id": "first",

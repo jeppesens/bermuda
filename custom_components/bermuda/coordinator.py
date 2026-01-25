@@ -63,7 +63,6 @@ from .const import CONF_UPDATE_INTERVAL
 from .const import CONFDATA_FLOORS
 from .const import CONFDATA_ROOMS
 from .const import CONFDATA_SCANNER_POSITIONS
-from .const import TRILATERATION_POSITION_TIMEOUT
 from .const import DEFAULT_ATTENUATION
 from .const import DEFAULT_DEVTRACK_TIMEOUT
 from .const import DEFAULT_MAX_RADIUS
@@ -86,10 +85,13 @@ from .const import REPAIR_SCANNER_WITHOUT_AREA
 from .const import SAVEOUT_COOLDOWN
 from .const import SIGNAL_DEVICE_NEW
 from .const import SIGNAL_SCANNERS_CHANGED
+from .const import TRILATERATION_POSITION_TIMEOUT
 from .const import UPDATE_INTERVAL
 from .trilateration import calculate_position
+from .trilateration import find_room_for_position
 from .util import mac_explode_formats
 from .util import mac_norm
+from .util import validate_scanners_for_trilateration
 
 if TYPE_CHECKING:
     from habluetooth import BluetoothServiceInfoBleak
@@ -737,44 +739,13 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         len(device.adverts),
                     )
 
-                    scanner_count = 0
-                    for advert in device.adverts.values():
-                        scanner = self.devices.get(advert.scanner_address)
-
-                        # Log each advert check
-                        if scanner is None:
-                            _LOGGER.debug("  - %s: Scanner not in devices", advert.scanner_address)
-                            continue
-                        if not scanner.is_scanner:
-                            _LOGGER.debug("  - %s: Not marked as scanner", scanner.name)
-                            continue
-                        if scanner.position is None:
-                            _LOGGER.debug("  - %s: No position configured for MAC %s", scanner.name, scanner.address)
-                            continue
-                        if advert.rssi_distance is None:
-                            _LOGGER.debug(
-                                "  - %s: rssi_distance is None (rssi=%.1f)",
-                                scanner.name,
-                                getattr(advert, "rssi", 0),
-                            )
-                            continue
-                        if advert.rssi_distance <= 0:
-                            _LOGGER.debug(
-                                "  - %s: rssi_distance <= 0 (%.2f)",
-                                scanner.name,
-                                advert.rssi_distance,
-                            )
-                            continue
-
-                        # This scanner is valid!
-                        scanner_count += 1
-                        _LOGGER.info(
-                            "  \u2713 %s: position=%s, distance=%.2fm, rssi=%.1f",
-                            scanner.name,
-                            scanner.position,
-                            advert.rssi_distance,
-                            getattr(advert, "rssi", 0),
-                        )
+                    # Validate scanners using shared helper (includes staleness check)
+                    valid_scanners = validate_scanners_for_trilateration(
+                        device,
+                        nowstamp,
+                        TRILATERATION_POSITION_TIMEOUT,
+                    )
+                    scanner_count = len(valid_scanners)
 
                     if scanner_count >= min_scanners:
                         _LOGGER.debug(
@@ -806,8 +777,6 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                 and result.confidence
                                 >= self.options.get(CONF_TRILATERATION_AREA_MIN_CONFIDENCE, 30.0)
                             ):
-                                from .trilateration import find_room_for_position
-
                                 _LOGGER.debug(
                                     "Checking room for position (%.2f, %.2f, %.2f)",
                                     result.x,
@@ -827,10 +796,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                     if area:
                                         # Override the distance-based area assignment
                                         old_area = device.area_name
-                                        device.area_id = area.id
-                                        device.area_name = area.name
-                                        device.area = area
-                                        device.area_icon = area.icon or device.area_icon
+                                        device._update_area_and_floor(area.id)
                                         _LOGGER.info(
                                             "Device %s area: %s → %s via trilateration (confidence: %.1f%%)",
                                             device.name,
@@ -914,9 +880,6 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
     def _async_gather_advert_data(self):
         """Perform the gathering of backend Bluetooth Data and updating scanners and devices."""
-        nowstamp = monotonic_time_coarse()
-        _timestamp_cutoff = nowstamp - min(PRUNE_TIME_DEFAULT, PRUNE_TIME_UNKNOWN_IRK)
-
         # Initialise ha_scanners if we haven't already
         if self._scanner_init_pending:
             _LOGGER.debug("Scanner init pending, calling _refresh_scanners")
@@ -1454,7 +1417,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         nowstamp - device.position_timestamp,
                     )
                     continue
-                
+
                 # Use min-distance for devices without trilateration or with stale positions
                 if device.position_timestamp is not None and nowstamp - device.position_timestamp > TRILATERATION_POSITION_TIMEOUT:
                     _LOGGER.debug(
@@ -1462,7 +1425,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         device.name,
                         nowstamp - device.position_timestamp,
                     )
-                
+
                 self._refresh_area_by_min_distance(device)
 
     @dataclass
@@ -1717,9 +1680,9 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
           - force=True or
           - self._force_full_scanner_init=True
         """
-        _new_ha_scanners = set[BaseHaScanner]
+        # _new_ha_scanners = set[BaseHaScanner]
         # Using new API in 2025.2
-        _new_ha_scanners = set(self._manager.async_current_scanners())
+        _new_ha_scanners: set[BaseHaScanner] = set(self._manager.async_current_scanners())
 
         if _new_ha_scanners is self._ha_scanners or _new_ha_scanners == self._ha_scanners:
             # No changes, but if we're in init phase, mark as complete
@@ -1753,13 +1716,12 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         if self._scanner_init_pending:
             _LOGGER.info("Scanner initialization complete, enabling position loading")
             self._scanner_init_pending = False
-
-        # Load scanner positions after scanner list changes (always reload to catch new scanners)
-        nowstamp = monotonic_time_coarse()
-        _LOGGER.info("Loading scanner positions after scanner list rebuild")
-        self.load_scanner_positions()
-        self._scanner_positions_loaded = True
-        self.stamp_last_position_load = nowstamp
+            # Load scanner positions on first initialization
+            nowstamp = monotonic_time_coarse()
+            _LOGGER.info("Loading scanner positions after initial scanner discovery")
+            self.load_scanner_positions()
+            self._scanner_positions_loaded = True
+            self.stamp_last_position_load = nowstamp
 
     def _async_purge_removed_scanners(self):
         """Demotes any devices that are no longer scanners based on new self.hascanners."""

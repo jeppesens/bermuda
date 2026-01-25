@@ -21,6 +21,7 @@ from .const import _LOGGER
 from .const import CONF_MAX_VELOCITY
 from .const import DEFAULT_MAX_VELOCITY
 from .const import TRILATERATION_POSITION_TIMEOUT
+from .util import validate_scanners_for_trilateration
 
 if TYPE_CHECKING:
     from .bermuda_device import BermudaDevice
@@ -52,76 +53,45 @@ def calculate_position(
     Returns:
         TrilaterationResult with (x,y,z) position and confidence, or None if insufficient data
     """
-    _LOGGER.info("=== TRILATERATION START for %s ===", device.name)
-
-    # Gather valid scanner positions and distances
-    scanner_data: list[tuple[tuple[float, float, float], float]] = []
+    _LOGGER.debug("=== TRILATERATION START for %s ===", device.name)
 
     _LOGGER.debug("Checking %d adverts for device %s", len(device.adverts), device.name)
 
-    for advert in device.adverts.values():
-        # Get the scanner device
-        scanner = device._coordinator.devices.get(advert.scanner_address)
-        if scanner is None or not scanner.is_scanner:
-            _LOGGER.debug("  - %s: Not a scanner, skipping", advert.scanner_address)
-            continue
+    # Gather valid scanner positions and distances using shared helper
+    valid_scanners = validate_scanners_for_trilateration(
+        device,
+        current_time,
+        TRILATERATION_POSITION_TIMEOUT,
+    )
 
-        # Scanner must have position configured
-        if scanner.position is None:
-            _LOGGER.debug("  - %s (%s): No position configured", scanner.name, advert.scanner_address)
-            continue
-
-        # Distance must be valid and recent
-        if advert.rssi_distance is None or advert.rssi_distance <= 0:
-            _LOGGER.debug("  - %s: Invalid distance (%s)", scanner.name, advert.rssi_distance)
-            continue
-
-        # Advert must be recent (not stale)
-        advert_age = current_time - advert.stamp
-        if advert_age > TRILATERATION_POSITION_TIMEOUT:
-            _LOGGER.debug(
-                "  - %s: Stale advert (%.1fs old, max %.1fs)",
-                scanner.name,
-                advert_age,
-                TRILATERATION_POSITION_TIMEOUT,
-            )
-            continue
-
-        scanner_data.append((scanner.position, advert.rssi_distance))
-        _LOGGER.info(
-            "  ✓ %s: pos=(%.2f, %.2f, %.2f) dist=%.2fm age=%.1fs",
-            scanner.name,
-            scanner.position[0],
-            scanner.position[1],
-            scanner.position[2],
-            advert.rssi_distance,
-            advert_age,
-        )
-
-    if not scanner_data:
-        _LOGGER.info("=== TRILATERATION FAILED: No valid scanners for %s ===", device.name)
+    if not valid_scanners:
+        _LOGGER.debug("=== TRILATERATION FAILED: No valid scanners for %s ===", device.name)
         return None
 
+    # Extract scanner positions and distances for trilateration
+    scanner_data: list[tuple[tuple[float, float, float], float]] = [
+        (scanner.position, advert.rssi_distance) for scanner, advert in valid_scanners
+    ]
     scanner_count = len(scanner_data)
-    _LOGGER.info("Using %d scanners for %s", scanner_count, device.name)
+    _LOGGER.debug("Using %d scanners for %s", scanner_count, device.name)
 
     # Route to appropriate algorithm based on scanner count
     result = None
     if scanner_count == 1:
-        _LOGGER.info("Routing to 1-scanner algorithm")
+        _LOGGER.debug("Routing to 1-scanner algorithm")
         result = _calculate_position_1_scanner(device, scanner_data, current_time)
     elif scanner_count == 2:
-        _LOGGER.info("Routing to 2-scanner bilateration algorithm")
+        _LOGGER.debug("Routing to 2-scanner bilateration algorithm")
         result = _calculate_position_2_scanners(device, scanner_data, current_time)
     elif scanner_count == 3:
-        _LOGGER.info("Routing to 3-scanner weighted centroid algorithm")
+        _LOGGER.debug("Routing to 3-scanner weighted centroid algorithm")
         result = _calculate_position_3_scanners(device, scanner_data, current_time)
     else:  # 4+
-        _LOGGER.info("Routing to %d-scanner overdetermined algorithm", scanner_count)
+        _LOGGER.debug("Routing to %d-scanner overdetermined algorithm", scanner_count)
         result = _calculate_position_4plus_scanners(device, scanner_data, current_time)
 
     if result:
-        _LOGGER.info(
+        _LOGGER.debug(
             "=== TRILATERATION SUCCESS for %s: (%.2f, %.2f, %.2f) confidence=%.1f%% method=%s ===",
             device.name,
             result.x,
@@ -158,7 +128,11 @@ def _calculate_position_1_scanner(
         dx = prev_x - sx
         dy = prev_y - sy
         dz = prev_z - sz
-        prev_distance = math.sqrt(dx**2 + dy**2 + dz**2)
+        try:
+            prev_distance = math.sqrt(dx**2 + dy**2 + dz**2)
+        except (ValueError, OverflowError) as e:
+            _LOGGER.warning("1-scanner: Math error calculating distance for %s: %s", device.name, e)
+            prev_distance = 0
 
         _LOGGER.debug("1-scanner: Previous distance from scanner: %.2fm", prev_distance)
 
@@ -169,7 +143,7 @@ def _calculate_position_1_scanner(
             y = sy + dy * scale
             z = sz + dz * scale
 
-            _LOGGER.info("1-scanner: Using directional method, result=(%.2f, %.2f, %.2f)", x, y, z)
+            _LOGGER.debug("1-scanner: Using directional method, result=(%.2f, %.2f, %.2f)", x, y, z)
 
             return TrilaterationResult(
                 x=x,
@@ -181,7 +155,7 @@ def _calculate_position_1_scanner(
             )
 
     # No previous position - just report scanner location
-    _LOGGER.info("1-scanner: No previous position, using scanner location (%.2f, %.2f, %.2f)", sx, sy, sz)
+    _LOGGER.debug("1-scanner: No previous position, using scanner location (%.2f, %.2f, %.2f)", sx, sy, sz)
     return TrilaterationResult(
         x=sx,
         y=sy,
@@ -425,7 +399,7 @@ def _weighted_centroid(
     y = weighted_y / total_weight
     z = weighted_z / total_weight
 
-    _LOGGER.info(
+    _LOGGER.debug(
         "Weighted centroid: Result=(%.2f, %.2f, %.2f) total_weight=%.4f",
         x,
         y,
@@ -439,9 +413,14 @@ def _weighted_centroid(
 
     # Reduce confidence if distances are very different (high variance)
     distances = [d for _, d in scanner_data]
-    avg_distance = sum(distances) / len(distances)
-    variance = sum((d - avg_distance)**2 for d in distances) / len(distances)
-    std_dev = math.sqrt(variance)
+    try:
+        avg_distance = sum(distances) / len(distances) if distances else 0
+        variance = sum((d - avg_distance)**2 for d in distances) / len(distances) if distances else 0
+        std_dev = math.sqrt(variance)
+    except (ValueError, ZeroDivisionError, OverflowError) as e:
+        _LOGGER.warning("Error calculating variance in weighted centroid: %s", e)
+        std_dev = 0
+        avg_distance = 1  # Avoid division by zero below
 
     # Reduce confidence if standard deviation is high relative to average
     if avg_distance > 0:

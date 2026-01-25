@@ -22,9 +22,11 @@ Get Bermuda trilateration up and running quickly with this condensed guide.
 2. Click each proxy device
 3. Copy MAC address from device info
 
-### 2. Create Position File (2 minutes)
+### 2. Import Positions via UI (2 minutes)
 
-Create `config/scanner_positions.json`:
+1. Settings → Devices & Services → Bermuda BLE Trilateration
+2. Click **⋮ menu** (three dots) → **Bulk Import Map & Scanners**
+3. Paste this JSON (replace MAC addresses with your scanners):
 
 ```json
 {
@@ -48,15 +50,19 @@ Create `config/scanner_positions.json`:
 }
 ```
 
+4. Click **"Replace All"** → **Submit**
+
 **Quick positioning tips:**
 - Don't stress about precision initially - you can refine later
 - Just estimate room corners in meters from an arbitrary origin
 - Set z (height) to 1.0 for wall-mounted, 0.5 for low placement
 - Use graph paper or measure with tape if available
 
-### 3. Restart Home Assistant (30 seconds)
+### 3. Reload Integration (10 seconds)
 
-Settings → System → Restart
+Settings → Devices & Services → Bermuda → **⋮ menu** → **Reload**
+
+(Or restart Home Assistant if you prefer)
 
 ### 4. Enable Position Sensor (30 seconds)
 
@@ -95,7 +101,8 @@ See [TRILATERATION.md](TRILATERATION.md) for full documentation.
 **Sensor stays "unknown"**
 - Check MAC addresses match exactly (case-insensitive but format matters)
 - Ensure JSON is valid (use JSONLint.com to validate)
-- Verify file is named `scanner_positions.json` (not .txt)
+- Verify positions were imported successfully (check logs for "Loaded X scanner positions")
+- Try re-importing via Bulk Import menu
 
 **Low confidence (<50%)**
 - Add more scanners

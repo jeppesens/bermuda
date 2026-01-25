@@ -623,7 +623,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 vol.Length(min=3, max=3),
                 [vol.Coerce(float)],
             ),
-        })
+        }, extra=vol.PREVENT_EXTRA)  # Reject unknown fields
 
         BULK_IMPORT_SCHEMA = vol.Schema({
             vol.Optional("floors", default=[]): [FLOOR_SCHEMA],
@@ -737,6 +737,9 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         for node in data.get("nodes", []):
             try:
                 normalized = mac_norm(node["id"])
+                if not normalized:
+                    errors["base"] = f"Invalid MAC address format: {node['id']}"
+                    return errors
                 scanner_macs.append(normalized)
             except (KeyError, TypeError, ValueError):
                 errors["base"] = f"Invalid MAC address format: {node['id']}"
