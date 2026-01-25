@@ -286,9 +286,12 @@ def _calculate_position_2_scanners(
 
     _LOGGER.debug("2-scanner: Distance between scanners: %.2fm", scanner_distance)
 
-    if scanner_distance and scanner_distance < 0.01:
-        # Scanners are at same position - can't trilaterate
-        _LOGGER.warning("2-scanner: Scanners too close (%.3fm) for %s", scanner_distance, device.address)
+    if scanner_distance < 0.01:
+        # Scanners are at same/nearly same position - can't trilaterate
+        if scanner_distance == 0.0:
+            _LOGGER.warning("2-scanner: Scanners at identical position for %s", device.address)
+        else:
+            _LOGGER.warning("2-scanner: Scanners too close (%.3fm) for %s", scanner_distance, device.address)
         return None
 
     # Check if circles intersect
@@ -316,7 +319,9 @@ def _calculate_position_2_scanners(
     # Use midpoint and perpendicular bisector approach
 
     # Distance from scanner1 to midpoint of intersection chord
-    a = (d1**2 - d2**2 + scanner_distance**2) / (2 * scanner_distance)
+    # Add small epsilon to prevent any floating-point edge cases
+    epsilon = 1e-10
+    a = (d1**2 - d2**2 + scanner_distance**2) / (2 * scanner_distance + epsilon)
 
     # Height of intersection point from line between scanners
     h_squared = d1**2 - a**2
@@ -353,7 +358,8 @@ def _calculate_position_2_scanners(
         perp_z = dx * up_vec[1] - dy * up_vec[0]
         perp_length = math.sqrt(perp_x**2 + perp_y**2 + perp_z**2)
 
-    # Normalize perpendicular vector
+    # Normalize perpendicular vector (with epsilon to prevent division by zero)
+    perp_length = max(perp_length, 1e-10)
     perp_x /= perp_length
     perp_y /= perp_length
     perp_z /= perp_length

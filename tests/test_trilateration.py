@@ -429,9 +429,13 @@ class TestCalculatePositionEdgeCases:
         assert result is None
 
     def test_2_scanners_at_same_location(self, mock_device, mock_scanner, mock_advert):
-        """Test degenerate case: 2 scanners at identical position."""
-        scanner1 = mock_scanner("s1", (5.0, 5.0, 1.0), "Scanner1")
-        scanner2 = mock_scanner("s2", (5.0, 5.0, 1.0), "Scanner2")
+        """Test degenerate case: 2 scanners at identical position.
+        
+        This tests the fix for ZeroDivisionError when scanner_distance == 0.0.
+        Uses exact (0.0, 0.0, 0.0) positions to guarantee true zero distance.
+        """
+        scanner1 = mock_scanner("s1", (0.0, 0.0, 0.0), "Scanner1")
+        scanner2 = mock_scanner("s2", (0.0, 0.0, 0.0), "Scanner2")
         mock_device._coordinator.devices = {"s1": scanner1, "s2": scanner2}
         mock_device.adverts = {
             "s1": mock_advert("s1", 3.0, 100.0),
@@ -439,9 +443,8 @@ class TestCalculatePositionEdgeCases:
         }
 
         result = calculate_position(mock_device, 101.0)
-        # Should fall back to weighted centroid or return None
-        # Either is acceptable for this degenerate case
-        assert result is None or result.method == "2-scanner-fallback"
+        # Must return None (can't trilaterate with scanners at same position)
+        assert result is None
 
     def test_high_variance_distances(self, mock_device, mock_scanner, mock_advert):
         """Test that high variance in distances reduces confidence."""
