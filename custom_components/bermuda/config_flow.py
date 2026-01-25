@@ -738,7 +738,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             try:
                 normalized = mac_norm(node["id"])
                 scanner_macs.append(normalized)
-            except Exception:  # noqa: BLE001
+            except (KeyError, TypeError, ValueError):
                 errors["base"] = f"Invalid MAC address format: {node['id']}"
                 return errors
 

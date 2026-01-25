@@ -650,29 +650,59 @@ class BermudaSensorPosition(BermudaSensor):
             )
             attrs["scanner_count"] = scanner_count
 
-        # Add room detection info
+        # Add room detection info, caching results on the device to avoid
+        # recomputing for every attribute access when the position has not changed.
         if self.coordinator.map_rooms:
-            from .trilateration import find_room_for_position
+            current_position = (x, y, z)
+            cached_position = getattr(self._device, "room_position_coords", None)
+            cached_room_id = getattr(self._device, "room_id", None)
+            cached_room_name = getattr(self._device, "room_name", None)
+            cached_floor_id = getattr(self._device, "floor_id", None)
 
-            room_id = find_room_for_position(
-                (x, y, z),
-                list(self.coordinator.map_rooms.values()),
-                list(self.coordinator.map_floors.values()) if self.coordinator.map_floors else None,
-            )
+            room_id = cached_room_id
+            room_name = cached_room_name
+            floor_id = cached_floor_id
+
+            # Recalculate only if we have no cached room info or the position changed
+            if cached_position != current_position or room_id is None:
+                from .trilateration import find_room_for_position
+
+                room_id = find_room_for_position(
+                    current_position,
+                    list(self.coordinator.map_rooms.values()),
+                    list(self.coordinator.map_floors.values())
+                    if self.coordinator.map_floors
+                    else None,
+                )
+
+                room_name = None
+                floor_id = None
+
+                if room_id:
+                    room = next(
+                        (
+                            r
+                            for r in self.coordinator.map_rooms.values()
+                            if r.get("area_id") == room_id or r.get("id") == room_id
+                        ),
+                        None,
+                    )
+                    if room:
+                        room_name = room.get("name", room_id)
+                        floor_id = room.get("floor")
+
+                # Cache the latest position and room info on the device
+                setattr(self._device, "room_position_coords", current_position)
+                setattr(self._device, "room_id", room_id)
+                setattr(self._device, "room_name", room_name)
+                setattr(self._device, "floor_id", floor_id)
 
             if room_id:
                 attrs["room_id"] = room_id
-                room = next(
-                    (
-                        r
-                        for r in self.coordinator.map_rooms.values()
-                        if r.get("area_id") == room_id or r.get("id") == room_id
-                    ),
-                    None,
-                )
-                if room:
-                    attrs["room_name"] = room.get("name", room_id)
-                    attrs["floor_id"] = room.get("floor")
+                if room_name is not None:
+                    attrs["room_name"] = room_name
+                if floor_id is not None:
+                    attrs["floor_id"] = floor_id
 
         return attrs
 
