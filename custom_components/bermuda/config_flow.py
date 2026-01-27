@@ -38,6 +38,7 @@ from .const import CONF_SAVE_AND_CLOSE
 from .const import CONF_SCANNER_INFO
 from .const import CONF_SCANNERS
 from .const import CONF_SMOOTHING_SAMPLES
+from .const import CONF_TRILATERATION_DEBUG
 from .const import CONF_UPDATE_INTERVAL
 from .const import CONFDATA_FLOORS
 from .const import CONFDATA_ROOMS
@@ -48,6 +49,7 @@ from .const import DEFAULT_MAX_RADIUS
 from .const import DEFAULT_MAX_VELOCITY
 from .const import DEFAULT_REF_POWER
 from .const import DEFAULT_SMOOTHING_SAMPLES
+from .const import DEFAULT_TRILATERATION_DEBUG
 from .const import DEFAULT_UPDATE_INTERVAL
 from .const import DISTANCE_INFINITE
 from .const import DOMAIN
@@ -237,6 +239,10 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 CONF_REF_POWER,
                 default=self.options.get(CONF_REF_POWER, DEFAULT_REF_POWER),
             ): vol.Coerce(float),
+            vol.Required(
+                CONF_TRILATERATION_DEBUG,
+                default=self.options.get(CONF_TRILATERATION_DEBUG, DEFAULT_TRILATERATION_DEBUG),
+            ): bool,
         }
 
         return self.async_show_form(step_id="globalopts", data_schema=vol.Schema(data_schema))

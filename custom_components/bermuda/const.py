@@ -173,10 +173,10 @@ DOCS[CONF_MAX_VELOCITY] = (
 CONF_DEVTRACK_TIMEOUT, DEFAULT_DEVTRACK_TIMEOUT = "devtracker_nothome_timeout", 30
 DOCS[CONF_DEVTRACK_TIMEOUT] = "Timeout in seconds for setting devices as `Not Home` / `Away`."  # fmt: skip
 
-CONF_ATTENUATION, DEFAULT_ATTENUATION = "attenuation", 3
-DOCS[CONF_ATTENUATION] = "Factor for environmental signal attenuation."
-CONF_REF_POWER, DEFAULT_REF_POWER = "ref_power", -55.0
-DOCS[CONF_REF_POWER] = "Default RSSI for signal at 1 metre."
+CONF_ATTENUATION, DEFAULT_ATTENUATION = "attenuation", 2.7
+DOCS[CONF_ATTENUATION] = "Factor for environmental signal attenuation (path loss exponent). Typical values: 2.5-2.7 for open spaces, 3.0-3.5 through walls. REQUIRES CALIBRATION for your environment."
+CONF_REF_POWER, DEFAULT_REF_POWER = "ref_power", -65.0
+DOCS[CONF_REF_POWER] = "Expected RSSI at 1 meter from device (dBm). Typical range: -59 to -75 dBm depending on transmitter power and antenna. REQUIRES CALIBRATION - measure actual RSSI at 1m for accurate distance calculation. Default -65 is a starting point only."
 
 CONF_SAVE_AND_CLOSE = "save_and_close"
 CONF_SCANNER_INFO = "scanner_info"
@@ -192,6 +192,31 @@ CONF_SMOOTHING_SAMPLES, DEFAULT_SMOOTHING_SAMPLES = "smoothing_samples", 20
 DOCS[CONF_SMOOTHING_SAMPLES] = (
     "How many samples to average distance smoothing. Bigger numbers"
     " make for slower distance increases. 10 or 20 seems good."
+)
+
+# RSSI filtering configuration
+CONF_RSSI_FILTER_MODE, DEFAULT_RSSI_FILTER_MODE = "rssi_filter_mode", "median_iqr"
+DOCS[CONF_RSSI_FILTER_MODE] = (
+    "RSSI filtering algorithm: 'median_iqr' (default, adaptive percentile-based with outlier rejection)"
+    " or 'legacy' (simple rolling average). median_iqr is more robust in noisy environments."
+)
+
+CONF_IQR_COEFFICIENT, DEFAULT_IQR_COEFFICIENT = "iqr_coefficient", 1.5
+DOCS[CONF_IQR_COEFFICIENT] = (
+    "Tukey fence coefficient for IQR outlier detection (default 1.5, range 1.0-2.0)."
+    " Lower values = stricter outlier rejection. Only used with median_iqr filter mode."
+)
+
+CONF_RSSI_TIME_WINDOW_MS, DEFAULT_RSSI_TIME_WINDOW_MS = "rssi_time_window_ms", 15000
+DOCS[CONF_RSSI_TIME_WINDOW_MS] = (
+    "Time window in milliseconds for RSSI filtering (default 15000ms = 15 seconds)."
+    " Only used with median_iqr filter mode."
+)
+
+CONF_TRILATERATION_DEBUG, DEFAULT_TRILATERATION_DEBUG = "trilateration_debug", False
+DOCS[CONF_TRILATERATION_DEBUG] = (
+    "Enable verbose debug logging for trilateration calculations."
+    " When disabled, only summary messages and warnings are logged."
 )
 
 # Trilateration configuration
@@ -219,20 +244,12 @@ DOCS[CONF_MAX_TRILATERATION_SCANNERS] = "Maximum number of scanners to use for t
 CONF_TRILATERATION_FILTER_COLINEAR, DEFAULT_TRILATERATION_FILTER_COLINEAR = "trilateration_filter_colinear", True
 DOCS[CONF_TRILATERATION_FILTER_COLINEAR] = "Filter out colinear scanners that create poor trilateration geometry"
 
-CONF_TRILATERATION_FLOOR_ATTENUATION, DEFAULT_TRILATERATION_FLOOR_ATTENUATION = (
-    "trilateration_floor_attenuation",
-    0.3,
+CONF_TRILATERATION_USE_VARIANCE_WEIGHTING, DEFAULT_TRILATERATION_USE_VARIANCE_WEIGHTING = (
+    "trilateration_use_variance_weighting",
+    True,
 )
-DOCS[CONF_TRILATERATION_FLOOR_ATTENUATION] = (
-    "Weight reduction factor for scanners on different floors (0.0-1.0, lower = more penalty)"
-)
-
-CONF_TRILATERATION_WALL_ATTENUATION, DEFAULT_TRILATERATION_WALL_ATTENUATION = (
-    "trilateration_wall_attenuation",
-    0.7,
-)
-DOCS[CONF_TRILATERATION_WALL_ATTENUATION] = (
-    "Weight reduction factor for horizontal distance through walls per 5m segment (0.0-1.0)"
+DOCS[CONF_TRILATERATION_USE_VARIANCE_WEIGHTING] = (
+    "Use RSSI variance to weight scanner reliability in trilateration (more stable signals get higher weight)"
 )
 
 CONF_TRILATERATION_OVERRIDE_AREA, DEFAULT_TRILATERATION_OVERRIDE_AREA = "trilateration_override_area", True

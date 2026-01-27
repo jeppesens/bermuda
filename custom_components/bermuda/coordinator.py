@@ -60,6 +60,7 @@ from .const import CONF_REF_POWER
 from .const import CONF_RSSI_OFFSETS
 from .const import CONF_SMOOTHING_SAMPLES
 from .const import CONF_TRILATERATION_AREA_MIN_CONFIDENCE
+from .const import CONF_TRILATERATION_DEBUG
 from .const import CONF_TRILATERATION_OVERRIDE_AREA
 from .const import CONF_UPDATE_INTERVAL
 from .const import CONFDATA_FLOORS
@@ -72,6 +73,7 @@ from .const import DEFAULT_MAX_TRILATERATION_SCANNERS
 from .const import DEFAULT_MAX_VELOCITY
 from .const import DEFAULT_REF_POWER
 from .const import DEFAULT_SMOOTHING_SAMPLES
+from .const import DEFAULT_TRILATERATION_DEBUG
 from .const import DEFAULT_UPDATE_INTERVAL
 from .const import DOMAIN
 from .const import DOMAIN_PRIVATE_BLE_DEVICE
@@ -762,7 +764,10 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                             scanner_count,
                             min_scanners,
                         )
-                        result = calculate_position(device, nowstamp)
+                        debug_enabled = self.config_entry.options.get(
+                            CONF_TRILATERATION_DEBUG, DEFAULT_TRILATERATION_DEBUG
+                        )
+                        result = calculate_position(device, nowstamp, debug_enabled)
                         if result:
                             _LOGGER.info(
                                 "Position calculated for %s: (%.2f, %.2f, %.2f) confidence=%.1f%% method=%s",

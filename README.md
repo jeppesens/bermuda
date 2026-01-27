@@ -155,6 +155,23 @@ This means your device's Area sensor will update based on precise position rathe
 - `trilateration_override_area` (default: true) - Use position to set device area
 - `trilateration_area_min_confidence` (default: 30%) - Minimum confidence to override area
 
+### Advanced RSSI Filtering (NEW) 🎯
+
+Bermuda now includes adaptive RSSI filtering inspired by ESPresence, providing robust outlier rejection for more accurate distance estimates in noisy BLE environments:
+
+- **Adaptive Percentile IQR Filtering**: Uses Tukey's outlier detection method to statistically reject RSSI spikes
+- **Variance-Based Trilateration Weighting**: Prioritizes scanners with stable signal quality  
+- **Automatic Buffer Sizing**: Adapts to different device advertisement rates
+
+**See [RSSI_FILTERING.md](RSSI_FILTERING.md) for complete documentation.**
+
+**Quick configuration (optional - defaults work well):**
+```yaml
+rssi_filter_mode: "median_iqr"  # or "legacy" for old behavior
+iqr_coefficient: 1.5  # 1.0-2.0, controls outlier strictness
+trilateration_use_variance_weighting: true  # weight scanners by signal quality
+```
+
 ### Tips:
 
 - Place proxies at room corners for best coverage

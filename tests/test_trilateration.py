@@ -430,7 +430,7 @@ class TestCalculatePositionEdgeCases:
 
     def test_2_scanners_at_same_location(self, mock_device, mock_scanner, mock_advert):
         """Test degenerate case: 2 scanners at identical position.
-        
+
         This tests the fix for ZeroDivisionError when scanner_distance == 0.0.
         Uses exact (0.0, 0.0, 0.0) positions to guarantee true zero distance.
         """

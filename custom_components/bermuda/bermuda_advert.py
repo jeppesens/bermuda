@@ -14,26 +14,26 @@ to the combination of the scanner and the device it is reporting.
 
 from __future__ import annotations
 
+import statistics
 from collections import deque
 from itertools import islice
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
+from typing import Final
 
 from bluetooth_data_tools import monotonic_time_coarse
 
-from .const import (
-    _LOGGER,
-    _LOGGER_SPAM_LESS,
-    CONF_ATTENUATION,
-    CONF_MAX_VELOCITY,
-    CONF_REF_POWER,
-    CONF_RSSI_OFFSETS,
-    CONF_SMOOTHING_SAMPLES,
-    DISTANCE_INFINITE,
-    DISTANCE_TIMEOUT,
-    HIST_KEEP_COUNT,
-)
-
-from .util import clean_charbuf, rssi_to_metres
+from .const import _LOGGER
+from .const import _LOGGER_SPAM_LESS
+from .const import CONF_ATTENUATION
+from .const import CONF_MAX_VELOCITY
+from .const import CONF_REF_POWER
+from .const import CONF_RSSI_OFFSETS
+from .const import CONF_SMOOTHING_SAMPLES
+from .const import DISTANCE_INFINITE
+from .const import DISTANCE_TIMEOUT
+from .const import HIST_KEEP_COUNT
+from .util import clean_charbuf
+from .util import rssi_to_metres
 
 if TYPE_CHECKING:
     from bleak.backends.scanner import AdvertisementData
@@ -45,6 +45,220 @@ if TYPE_CHECKING:
 # so we're just disabling it for the whole file.
 # https://github.com/astral-sh/ruff/issues/4244
 # ruff: noqa: PLR1730
+
+
+class AdaptivePercentileRSSI:
+    """
+    Adaptive percentile-based RSSI filtering using IQR (Interquartile Range) method.
+
+    This filtering approach is inspired by ESPresense's implementation and provides
+    robust outlier rejection using Tukey's outlier detection method. It maintains
+    a time-windowed buffer of RSSI readings and adaptively sizes the buffer based
+    on advertisement rate.
+
+    The IQR method calculates quartiles (Q1, median, Q3) and applies a Tukey fence
+    to reject outliers: [Q1 - k*IQR, Q3 + k*IQR]. Values within the fence are
+    averaged to produce a filtered RSSI value.
+    """
+
+    def __init__(
+        self,
+        time_window_ms: float = 15000,
+        initial_max_readings: int = 20,
+        min_readings: int = 10,
+        max_readings: int = 200,
+        iqr_coefficient: float = 1.5,
+    ) -> None:
+        """
+        Initialize adaptive percentile RSSI filter.
+
+        Args:
+            time_window_ms: Time window in milliseconds for keeping readings (default 15000ms = 15s)
+            initial_max_readings: Initial buffer size (default 20)
+            min_readings: Minimum buffer size (default 10)
+            max_readings: Maximum buffer size (default 200)
+            iqr_coefficient: Tukey fence coefficient k (default 1.5, standard for outlier detection)
+        """
+        self.time_window_ms = time_window_ms
+        self.min_readings = min_readings
+        self.max_readings = max_readings
+        self.iqr_coefficient = iqr_coefficient
+        # Store tuples of (rssi, timestamp)
+        self.readings: deque[tuple[float, float]] = deque(maxlen=initial_max_readings)
+        self._last_adjustment_time: float = 0
+        self._adjustment_interval: float = 10.0  # Adjust buffer size every 10 seconds
+
+    def add_measurement(self, rssi: float, timestamp: float) -> None:
+        """
+        Add a new RSSI measurement with timestamp.
+
+        Args:
+            rssi: RSSI value in dBm
+            timestamp: Timestamp of the measurement (monotonic time)
+        """
+        self.readings.append((rssi, timestamp))
+        self._remove_expired(timestamp)
+        self._adjust_buffer_size(timestamp)
+
+    def _remove_expired(self, current_time: float) -> None:
+        """Remove readings older than the time window."""
+        cutoff_time = current_time - (self.time_window_ms / 1000.0)
+        # Remove from left (oldest) while they're too old
+        while self.readings and self.readings[0][1] < cutoff_time:
+            self.readings.popleft()
+
+    def _adjust_buffer_size(self, current_time: float) -> None:
+        """
+        Dynamically adjust buffer size based on advertisement rate.
+
+        This ensures we maintain consistent time-window coverage regardless of
+        whether the device advertises every 100ms or 1000ms.
+        """
+        # Only adjust periodically to avoid excessive resizing
+        if current_time - self._last_adjustment_time < self._adjustment_interval:
+            return
+
+        self._last_adjustment_time = current_time
+
+        if len(self.readings) < 2:
+            return
+
+        # Calculate average interval between advertisements
+        time_span = current_time - self.readings[0][1]
+        avg_interval = time_span / len(self.readings) if len(self.readings) > 0 else 1.0
+
+        # Calculate target buffer size to fill time window
+        # Add small epsilon to avoid division by zero
+        target_size = int(self.time_window_ms / (max(avg_interval, 0.001) * 1000))
+        target_size = max(self.min_readings, min(target_size, self.max_readings))
+
+        # Resize deque if needed
+        if target_size != self.readings.maxlen:
+            _LOGGER.debug(
+                "Adjusting RSSI filter buffer size from %d to %d (avg interval: %.3fs)",
+                self.readings.maxlen,
+                target_size,
+                avg_interval,
+            )
+            # Create new deque with new maxlen, preserving most recent readings
+            new_readings: deque[tuple[float, float]] = deque(
+                islice(self.readings, max(0, len(self.readings) - target_size), len(self.readings)),
+                maxlen=target_size,
+            )
+            self.readings = new_readings
+
+    def _calculate_percentile(self, sorted_values: list[float], percentile: float) -> float:
+        """
+        Calculate percentile from sorted values using linear interpolation.
+
+        Args:
+            sorted_values: List of values sorted in ascending order
+            percentile: Percentile to calculate (0.0 to 1.0)
+
+        Returns:
+            Interpolated percentile value
+        """
+        if not sorted_values:
+            return 0.0
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+
+        # Use linear interpolation between closest ranks
+        index = percentile * (len(sorted_values) - 1)
+        lower_idx = int(index)
+        upper_idx = min(lower_idx + 1, len(sorted_values) - 1)
+        fraction = index - lower_idx
+
+        return sorted_values[lower_idx] * (1 - fraction) + sorted_values[upper_idx] * fraction
+
+    def get_median_iqr(self, k: float | None = None) -> float | None:
+        """
+        Get mean of RSSI values within Tukey fence (Q1 - k*IQR, Q3 + k*IQR).
+
+        This implements Tukey's outlier detection method:
+        1. Calculate Q1 (25th percentile), median (50th), Q3 (75th percentile)
+        2. Calculate IQR = Q3 - Q1
+        3. Define fence: [Q1 - k*IQR, Q3 + k*IQR]
+        4. Return mean of values within fence, or median if all rejected
+
+        Args:
+            k: Tukey fence coefficient (default: use self.iqr_coefficient, typically 1.5)
+
+        Returns:
+            Filtered RSSI value, or None if no readings available
+        """
+        if not self.readings:
+            return None
+
+        if len(self.readings) == 1:
+            return self.readings[0][0]
+
+        k = k if k is not None else self.iqr_coefficient
+
+        # Extract and sort RSSI values
+        rssi_values = sorted([r[0] for r in self.readings])
+
+        # Calculate quartiles
+        q1 = self._calculate_percentile(rssi_values, 0.25)
+        q2_median = self._calculate_percentile(rssi_values, 0.50)
+        q3 = self._calculate_percentile(rssi_values, 0.75)
+        iqr = q3 - q1
+
+        # Calculate Tukey fence bounds
+        lower_fence = q1 - k * iqr
+        upper_fence = q3 + k * iqr
+
+        # Filter values within fence
+        survivors = [v for v in rssi_values if lower_fence <= v <= upper_fence]
+
+        # Return mean of survivors, or median if all were rejected
+        if survivors:
+            return statistics.mean(survivors)
+        return q2_median
+
+    def get_rssi_variance(self) -> float:
+        """
+        Calculate variance of RSSI values in the buffer.
+
+        Returns:
+            Variance of RSSI values, or 0.0 if insufficient data
+        """
+        if len(self.readings) < 2:
+            return 0.0
+
+        rssi_values = [r[0] for r in self.readings]
+        return statistics.variance(rssi_values)
+
+    def get_distance_variance(self, ref_power: float, attenuation: float) -> float:
+        """
+        Calculate variance of distance estimates from RSSI variance.
+
+        Converts RSSI readings to distances using the log-distance path loss model,
+        then calculates the variance of those distance values.
+
+        Args:
+            ref_power: Reference RSSI at 1 meter (typically -65 to -75 dBm)
+            attenuation: Path loss exponent (typically 2.7 to 3.5)
+
+        Returns:
+            Variance of distance estimates in meters, or 0.0 if insufficient data
+        """
+        if len(self.readings) < 2:
+            return 0.0
+
+        # Convert each RSSI to distance
+        distances = [10 ** ((ref_power - rssi) / (10 * attenuation)) for rssi, _ in self.readings]
+
+        return statistics.variance(distances)
+
+    def get_sample_count(self) -> int:
+        """Get current number of samples in the buffer."""
+        return len(self.readings)
+
+    def clear(self) -> None:
+        """Clear all readings from the buffer."""
+        self.readings.clear()
+        self._last_adjustment_time = 0
 
 
 class BermudaAdvert(dict):
@@ -90,6 +304,13 @@ class BermudaAdvert(dict):
         self.rssi_distance: float | None = None
         self.rssi_distance_raw: float
         self.stale_update_count = 0  # How many times we did an update but no new stamps were found.
+
+        # Adaptive percentile RSSI filter for advanced outlier rejection
+        self.adaptive_rssi_filter: AdaptivePercentileRSSI = AdaptivePercentileRSSI()
+        self.rssi_filtered: float | None = None  # Filtered RSSI from IQR method
+        self.rssi_variance: float = 0.0  # Variance of RSSI measurements
+        self.distance_variance: float = 0.0  # Variance of distance estimates
+
         # Using deques for O(1) prepend operations in rolling history buffers
         self.hist_stamp: deque[float] = deque(maxlen=HIST_KEEP_COUNT)
         self.hist_rssi: deque[int] = deque(maxlen=HIST_KEEP_COUNT)
@@ -191,6 +412,15 @@ class BermudaAdvert(dict):
             self.rssi = advertisementdata.rssi
             self.hist_rssi.appendleft(self.rssi)
 
+            # Add to adaptive filter and update filtered RSSI
+            if new_stamp is not None:
+                self.adaptive_rssi_filter.add_measurement(self.rssi, new_stamp)
+                self.rssi_filtered = self.adaptive_rssi_filter.get_median_iqr()
+                self.rssi_variance = self.adaptive_rssi_filter.get_rssi_variance()
+                self.distance_variance = self.adaptive_rssi_filter.get_distance_variance(
+                    self.ref_power, self.conf_attenuation
+                )
+
             self._update_raw_distance(reading_is_new=True)
 
             # Note: this is not actually the interval between adverts,
@@ -282,9 +512,20 @@ class BermudaAdvert(dict):
         setting change (such as altering a device's ref_power setting).
         """
         # Check if we should use a device-based ref_power
-        if self.ref_power == 0:  # No user-supplied per-device value
+        if not self.ref_power:  # No user-supplied per-device value
             # use global default
             ref_power = self.conf_ref_power
+            
+            # Warn if ref_power seems unrealistic (likely misconfigured)
+            if ref_power is not None and (ref_power > -50 or ref_power < -85):
+                _LOGGER_SPAM_LESS.warning(
+                    f"ref_power_unusual_{self._device.address}",
+                    "Unusual ref_power value %.1f dBm for %s. Typical range is -59 to -75 dBm. "
+                    "This may cause inaccurate distance calculations. Please calibrate by measuring "
+                    "actual RSSI at 1 meter from device.",
+                    ref_power,
+                    self._device.name,
+                )
         else:
             ref_power = self.ref_power
 

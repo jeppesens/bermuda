@@ -14,5 +14,12 @@
   "cSpell.words": [
     "bermuda",
     "CONFDATA"
-  ]
+  ],
+  "chat.tools.terminal.autoApprove": {
+    "/^python3 -m pytest tests/test_util\\.py -v$/": {
+      "approve": true,
+      "matchCommandLine": true
+    },
+    "./scripts/test": true
+  }
 }
