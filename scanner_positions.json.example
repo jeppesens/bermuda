@@ -1,0 +1,163 @@
+{
+    "_comment": "This is an EXAMPLE file showing the JSON format for Bermuda scanner positions and room definitions.",
+    "_comment2": "This file is NOT automatically loaded by Bermuda. To use this configuration:",
+    "_comment3": "1. Copy the contents of this file",
+    "_comment4": "2. Go to Settings → Devices & Services → Bermuda BLE Trilateration",
+    "_comment5": "3. Click the menu (⋮) → 'Bulk Import Map & Scanners'",
+    "_comment6": "4. Paste the JSON into the text field and submit",
+    "_comment7": "Note: Remove these _comment fields when creating your actual configuration.",
+    "floors": [
+        {
+            "id": "first",
+            "name": "First Floor",
+            "bounds": [[0, 0, 0], [29, 23.5, 3]]
+        },
+        {
+            "id": "second",
+            "name": "Second Floor",
+            "bounds": [[8.8, 13.9, 3], [19.6, 23.6, 5.4]]
+        }
+    ],
+    "rooms": [
+        {
+            "id": "storage",
+            "name": "Storage",
+            "floor": "first",
+            "area_id": "storage",
+            "points": [[2, 0], [2, 3.5], [19.2, 3.5], [19.2, 0]]
+        },
+        {
+            "id": "entrance",
+            "name": "Entrance",
+            "floor": "first",
+            "area_id": "entrance",
+            "points": [[12.6, 13.9], [12.6, 18.8], [14.2, 18.8], [14.2, 19.1], [16.8, 19.1], [16.8, 17.1], [15.5, 17.1], [15.5, 13.9]]
+        },
+        {
+            "id": "kitchen",
+            "name": "Kitchen",
+            "floor": "first",
+            "area_id": "kitchen",
+            "points": [[8.8, 14.7], [8.8, 18.8], [12.6, 18.8], [12.6, 14.7]]
+        },
+        {
+            "id": "dining_room",
+            "name": "Dining Room",
+            "floor": "first",
+            "area_id": "dining_room",
+            "points": [[9.6, 18.8], [9.6, 23.6], [14.2, 23.6], [14.2, 18.8]]
+        },
+        {
+            "id": "tv_room",
+            "name": "TV Room",
+            "floor": "first",
+            "area_id": "tv_room",
+            "points": [[14.2, 19.1], [14.2, 23.6], [18.8, 23.6], [18.8, 19.1]]
+        },
+        {
+            "id": "downstairs_bathroom",
+            "name": "Downstairs Bathroom",
+            "floor": "first",
+            "area_id": "downstairs_bathroom",
+            "points": [[16.8, 19.1], [19.6, 19.1], [19.6, 17.1], [16.8, 17.1]]
+        },
+        {
+            "id": "playroom",
+            "name": "Playroom",
+            "floor": "first",
+            "area_id": "playroom",
+            "points": [[15.5, 13.9], [15.5, 17.1], [19.6, 17.1], [19.6, 13.9]]
+        },
+        {
+            "id": "patio",
+            "name": "Patio",
+            "floor": "first",
+            "area_id": "patio",
+            "points": [[18.8, 19.1], [18.8, 23.6], [23.6, 23.6], [23.6, 13.9], [19.6, 13.9], [19.6, 19.1]]
+        },
+        {
+            "id": "garden",
+            "name": "Garden",
+            "floor": "first",
+            "area_id": "garden",
+            "points": [[2, 3.5], [7, 14.7], [12.6, 14.7], [12.6, 13.9], [23.6, 13.9], [23.6, 23.6], [29, 23.6], [29, 0], [19.2, 0], [19.2, 3.5]]
+        },
+        {
+            "id": "upstairs_hallway",
+            "name": "Upstairs Hallway",
+            "floor": "second",
+            "area_id": "upstairs_hallway",
+            "points": [[12.6, 13.9], [12.6, 18.8], [14.2, 18.8], [14.2, 19.1], [15.5, 19.1], [15.5, 13.9]]
+        },
+        {
+            "id": "office",
+            "name": "Office",
+            "floor": "second",
+            "area_id": "office",
+            "points": [[15.5, 13.9], [15.5, 19.1], [19.6, 19.1], [19.6, 13.9]]
+        },
+        {
+            "id": "girls_bedroom",
+            "name": "Girls Bedroom",
+            "floor": "second",
+            "area_id": "girls_bedroom",
+            "points": [[14.2, 19.1], [14.2, 23.6], [18.8, 23.6], [18.8, 19.1]]
+        },
+        {
+            "id": "bedroom",
+            "name": "Bedroom",
+            "floor": "second",
+            "area_id": "bedroom",
+            "points": [[9.6, 18.8], [9.6, 23.6], [14.2, 23.6], [14.2, 18.8]]
+        },
+        {
+            "id": "upstairs_bathroom",
+            "name": "Upstairs Bathroom",
+            "floor": "second",
+            "area_id": "upstairs_bathroom",
+            "points": [[8.8, 14.7], [8.8, 18.8], [12.6, 18.8], [12.6, 14.7]]
+        }
+    ],
+    "nodes": [
+        {
+            "id": "30:ED:A0:C9:BA:6A",
+            "name": "TV Room Proxy",
+            "point": [15.7, 23.5, 0.2]
+        },
+        {
+            "id": "20:F8:3B:09:57:35",
+            "name": "Kitchen Voice",
+            "point": [12.9, 18.7, 1]
+        },
+        {
+            "id": "48:E7:29:89:87:20",
+            "name": "Entrance Proxy Ceiling",
+            "point": [13.6, 15.8, 2.4]
+        },
+        {
+            "id": "44:17:93:D0:9F:6C",
+            "name": "Shelly Doorbell Ceiling",
+            "point": [13.6, 14.8, 2]
+        },
+        {
+            "id": "80:64:6F:E2:CA:38",
+            "name": "Storage Proxy",
+            "point": [7, 3, 3]
+        },
+        {
+            "id": "48:E7:29:89:9D:0C",
+            "name": "Storage Proxy 2",
+            "point": [5, 3, 3]
+        },
+        {
+            "id": "48:E7:29:8D:18:7C",
+            "name": "Server Cabinet Proxy",
+            "point": [13.9, 18.7, 0.5]
+        },
+        {
+            "id": "48:E7:29:89:8F:BA",
+            "name": "Girls Bedroom Proxy",
+            "point": [18.7, 22.6, 4.5]
+        }
+    ]
+}

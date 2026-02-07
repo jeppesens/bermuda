@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
@@ -10,45 +11,50 @@ from homeassistant import config_entries
 from homeassistant.config_entries import OptionsFlowWithConfigEntry
 from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr
-from homeassistant.helpers.selector import (
-    DeviceSelector,
-    DeviceSelectorConfig,
-    ObjectSelector,
-    SelectOptionDict,
-    SelectSelector,
-    SelectSelectorConfig,
-    SelectSelectorMode,
-)
+from homeassistant.helpers.selector import DeviceSelector
+from homeassistant.helpers.selector import DeviceSelectorConfig
+from homeassistant.helpers.selector import ObjectSelector
+from homeassistant.helpers.selector import SelectOptionDict
+from homeassistant.helpers.selector import SelectSelector
+from homeassistant.helpers.selector import SelectSelectorConfig
+from homeassistant.helpers.selector import SelectSelectorMode
+from homeassistant.helpers.selector import TextSelector
+from homeassistant.helpers.selector import TextSelectorConfig
+from homeassistant.helpers.selector import TextSelectorType
 
-from .const import (
-    ADDR_TYPE_IBEACON,
-    ADDR_TYPE_PRIVATE_BLE_DEVICE,
-    BDADDR_TYPE_RANDOM_RESOLVABLE,
-    CONF_ATTENUATION,
-    CONF_DEVICES,
-    CONF_DEVTRACK_TIMEOUT,
-    CONF_MAX_RADIUS,
-    CONF_MAX_VELOCITY,
-    CONF_REF_POWER,
-    CONF_RSSI_OFFSETS,
-    CONF_SAVE_AND_CLOSE,
-    CONF_SCANNER_INFO,
-    CONF_SCANNERS,
-    CONF_SMOOTHING_SAMPLES,
-    CONF_UPDATE_INTERVAL,
-    DEFAULT_ATTENUATION,
-    DEFAULT_DEVTRACK_TIMEOUT,
-    DEFAULT_MAX_RADIUS,
-    DEFAULT_MAX_VELOCITY,
-    DEFAULT_REF_POWER,
-    DEFAULT_SMOOTHING_SAMPLES,
-    DEFAULT_UPDATE_INTERVAL,
-    DISTANCE_INFINITE,
-    DOMAIN,
-    DOMAIN_PRIVATE_BLE_DEVICE,
-    NAME,
-)
-from .util import mac_redact, rssi_to_metres
+from .const import ADDR_TYPE_IBEACON
+from .const import ADDR_TYPE_PRIVATE_BLE_DEVICE
+from .const import BDADDR_TYPE_RANDOM_RESOLVABLE
+from .const import CONF_ATTENUATION
+from .const import CONF_DEVICES
+from .const import CONF_DEVTRACK_TIMEOUT
+from .const import CONF_IMPORT_MODE
+from .const import CONF_JSON_IMPORT
+from .const import CONF_MAX_RADIUS
+from .const import CONF_MAX_VELOCITY
+from .const import CONF_REF_POWER
+from .const import CONF_RSSI_OFFSETS
+from .const import CONF_SAVE_AND_CLOSE
+from .const import CONF_SCANNER_INFO
+from .const import CONF_SCANNERS
+from .const import CONF_SMOOTHING_SAMPLES
+from .const import CONF_UPDATE_INTERVAL
+from .const import CONFDATA_FLOORS
+from .const import CONFDATA_ROOMS
+from .const import CONFDATA_SCANNER_POSITIONS
+from .const import DEFAULT_ATTENUATION
+from .const import DEFAULT_DEVTRACK_TIMEOUT
+from .const import DEFAULT_MAX_RADIUS
+from .const import DEFAULT_MAX_VELOCITY
+from .const import DEFAULT_REF_POWER
+from .const import DEFAULT_SMOOTHING_SAMPLES
+from .const import DEFAULT_UPDATE_INTERVAL
+from .const import DISTANCE_INFINITE
+from .const import DOMAIN
+from .const import DOMAIN_PRIVATE_BLE_DEVICE
+from .const import NAME
+from .util import mac_redact
+from .util import rssi_to_metres
 
 if TYPE_CHECKING:
     from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
@@ -190,6 +196,8 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 "selectdevices": "Select Devices",
                 "calibration1_global": "Calibration 1: Global",
                 "calibration2_scanners": "Calibration 2: Scanner RSSI Offsets",
+                "bulk_import": "Bulk Import Map & Scanners",
+                "bulk_export": "Export Map & Scanners (JSON)",
             },
             description_placeholders=messages,
         )
@@ -580,6 +588,253 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         # We couldn't match the HA device id to a bermuda device mac.
         return None
 
+    async def async_step_bulk_import(self, user_input=None):
+        """Handle JSON bulk import of scanner positions, floors, and rooms."""
+        from .util import mac_norm
+
+        # Validation schemas
+        FLOOR_SCHEMA = vol.Schema({
+            vol.Required("id"): str,
+            vol.Required("name"): str,
+            vol.Required("bounds"): vol.All(
+                list,
+                vol.Length(min=2, max=2),
+                [vol.All(list, vol.Length(min=3, max=3), [vol.Coerce(float)])],
+            ),
+        })
+
+        ROOM_SCHEMA = vol.Schema({
+            vol.Required("id"): str,
+            vol.Required("name"): str,
+            vol.Required("floor"): str,
+            vol.Required("area_id"): str,
+            vol.Required("points"): vol.All(
+                list,
+                vol.Length(min=3),  # Polygon needs at least 3 points
+                [vol.All(list, vol.Length(min=2, max=2), [vol.Coerce(float)])],
+            ),
+        })
+
+        NODE_SCHEMA = vol.Schema({
+            vol.Required("id"): str,  # MAC address
+            vol.Optional("name"): str,
+            vol.Required("point"): vol.All(
+                list,
+                vol.Length(min=3, max=3),
+                [vol.Coerce(float)],
+            ),
+        }, extra=vol.PREVENT_EXTRA)  # Reject unknown fields
+
+        BULK_IMPORT_SCHEMA = vol.Schema({
+            vol.Optional("floors", default=[]): [FLOOR_SCHEMA],
+            vol.Optional("rooms", default=[]): [ROOM_SCHEMA],
+            vol.Optional("nodes", default=[]): [NODE_SCHEMA],
+        })
+
+        if user_input is not None:
+            # Validate and import
+            try:
+                data = json.loads(user_input[CONF_JSON_IMPORT])
+                # Validate against BULK_IMPORT_SCHEMA
+                validated_data = BULK_IMPORT_SCHEMA(data)
+
+                # Additional validation
+                errors = self._validate_bulk_import(validated_data)
+
+                if errors:
+                    return self.async_show_form(
+                        step_id="bulk_import",
+                        data_schema=self._build_bulk_import_schema(user_input[CONF_IMPORT_MODE]),
+                        errors=errors,
+                        description_placeholders=self._build_import_description(),
+                    )
+
+                # Store in config entry
+                await self._apply_bulk_import(validated_data, user_input[CONF_IMPORT_MODE])
+
+                return await self._update_options()
+
+            except json.JSONDecodeError as e:
+                return self.async_show_form(
+                    step_id="bulk_import",
+                    data_schema=self._build_bulk_import_schema(),
+                    errors={"base": f"Invalid JSON: {e}"},
+                    description_placeholders=self._build_import_description(),
+                )
+            except vol.Invalid as e:
+                return self.async_show_form(
+                    step_id="bulk_import",
+                    data_schema=self._build_bulk_import_schema(),
+                    errors={"base": f"Validation error: {e}"},
+                    description_placeholders=self._build_import_description(),
+                )
+
+        # Show form
+        return self.async_show_form(
+            step_id="bulk_import",
+            data_schema=self._build_bulk_import_schema(),
+            description_placeholders=self._build_import_description(),
+        )
+
+    def _build_bulk_import_schema(self, default_mode="replace"):
+        """Build schema for bulk import form."""
+        return vol.Schema({
+            vol.Required(CONF_JSON_IMPORT): TextSelector(
+                TextSelectorConfig(
+                    type=TextSelectorType.TEXT,
+                    multiline=True,
+                )
+            ),
+            vol.Required(CONF_IMPORT_MODE, default=default_mode): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(value="replace", label="Replace All"),
+                        SelectOptionDict(value="merge", label="Merge (keep existing)"),
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+        })
+
+    def _build_import_description(self):
+        """Build description placeholders for bulk import form."""
+        return {
+            "instructions": (
+                "Paste JSON configuration for scanner positions, floors, and rooms.\n\n"
+                "**Import Mode:**\n"
+                "- **Replace All**: Removes existing data and imports new\n"
+                "- **Merge**: Keeps existing data, updates matching IDs\n\n"
+                "See [scanner_positions.json.example](https://github.com/agittins/bermuda/blob/main/scanner_positions.json.example) for format."
+            )
+        }
+
+    def _validate_bulk_import(self, data: dict) -> dict[str, str] | None:
+        """Validate bulk import data. Returns error dict or None."""
+        from .util import mac_norm
+
+        errors = {}
+
+        # Check floor references in rooms
+        floor_ids = {f["id"] for f in data.get("floors", [])}
+        for room in data.get("rooms", []):
+            if room["floor"] not in floor_ids:
+                errors["base"] = f"Room '{room['id']}' references unknown floor '{room['floor']}'"
+                return errors
+
+        # Check for duplicate IDs
+        floor_id_list = [f["id"] for f in data.get("floors", [])]
+        if len(floor_id_list) != len(set(floor_id_list)):
+            errors["base"] = "Duplicate floor IDs found"
+            return errors
+
+        room_id_list = [r["id"] for r in data.get("rooms", [])]
+        if len(room_id_list) != len(set(room_id_list)):
+            errors["base"] = "Duplicate room IDs found"
+            return errors
+
+        # Normalize and check scanner MACs
+        scanner_macs = []
+        for node in data.get("nodes", []):
+            try:
+                normalized = mac_norm(node["id"])
+                if not normalized:
+                    errors["base"] = f"Invalid MAC address format: {node['id']}"
+                    return errors
+                scanner_macs.append(normalized)
+            except (KeyError, TypeError, ValueError):
+                errors["base"] = f"Invalid MAC address format: {node['id']}"
+                return errors
+
+        if len(scanner_macs) != len(set(scanner_macs)):
+            errors["base"] = "Duplicate scanner MAC addresses found"
+            return errors
+
+        return None
+
+    async def _apply_bulk_import(self, data: dict, mode: str):
+        """Apply validated bulk import data to config entry."""
+        from .util import mac_norm
+
+        if mode == "replace":
+            # Replace all data
+            self.options[CONFDATA_FLOORS] = data.get("floors", [])
+            self.options[CONFDATA_ROOMS] = data.get("rooms", [])
+
+            # Scanner positions as dict keyed by normalized MAC
+            positions = {}
+            for node in data.get("nodes", []):
+                mac = mac_norm(node["id"])
+                positions[mac] = {
+                    "name": node.get("name"),
+                    "point": node["point"],
+                }
+            self.options[CONFDATA_SCANNER_POSITIONS] = positions
+
+        else:  # mode == "merge"
+            # Merge floors (update existing, add new)
+            existing_floors = {f["id"]: f for f in self.options.get(CONFDATA_FLOORS, [])}
+            for floor in data.get("floors", []):
+                existing_floors[floor["id"]] = floor
+            self.options[CONFDATA_FLOORS] = list(existing_floors.values())
+
+            # Same for rooms
+            existing_rooms = {r["id"]: r for r in self.options.get(CONFDATA_ROOMS, [])}
+            for room in data.get("rooms", []):
+                existing_rooms[room["id"]] = room
+            self.options[CONFDATA_ROOMS] = list(existing_rooms.values())
+
+            # Same for scanner positions
+            existing_positions = self.options.get(CONFDATA_SCANNER_POSITIONS, {})
+            for node in data.get("nodes", []):
+                mac = mac_norm(node["id"])
+                existing_positions[mac] = {
+                    "name": node.get("name"),
+                    "point": node["point"],
+                }
+            self.options[CONFDATA_SCANNER_POSITIONS] = existing_positions
+
+    async def async_step_bulk_export(self, user_input=None):
+        """Export current scanner positions as JSON."""
+        # Build JSON from current config entry + live data
+        export_data = {
+            "floors": self.options.get(CONFDATA_FLOORS, []),
+            "rooms": self.options.get(CONFDATA_ROOMS, []),
+            "nodes": []
+        }
+
+        # Add scanner positions from config entry or live devices
+        positions = self.options.get(CONFDATA_SCANNER_POSITIONS, {})
+        for mac, pos_data in positions.items():
+            export_data["nodes"].append({
+                "id": mac.upper(),
+                "name": pos_data.get("name", ""),
+                "point": pos_data["point"],
+            })
+
+        # Also include scanners with positions not in config entry
+        for device in self.coordinator.devices.values():
+            if device.is_scanner and device.position:
+                mac = device.address
+                if mac not in positions:
+                    export_data["nodes"].append({
+                        "id": mac.upper(),
+                        "name": device.name,
+                        "point": list(device.position),
+                    })
+
+        json_output = json.dumps(export_data, indent=2)
+
+        # Show form with readonly text area
+        return self.async_show_form(
+            step_id="bulk_export",
+            data_schema=vol.Schema({}),  # Empty schema, just show info
+            description_placeholders={
+                "json_output": f"```json\n{json_output}\n```",
+                "instructions": "Copy the JSON below to save your current configuration.",
+            },
+        )
+
     async def _update_options(self):
         """Update config entry options."""
         return self.async_create_entry(title=NAME, data=self.options)
+
