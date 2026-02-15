@@ -13,3 +13,8 @@ dump_devices:
       required: false
       example: "False"
       default: false
+
+check_scanner_broadcasting:
+  name: Check Scanner Broadcasting
+  description: Check which scanners are broadcasting BLE advertisements for scanner-to-scanner calibration
+  fields: {}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re as _re
 from typing import TYPE_CHECKING
 
 import voluptuous as vol
@@ -24,8 +25,16 @@ from homeassistant.helpers.selector import TextSelectorType
 
 from .const import ADDR_TYPE_IBEACON
 from .const import ADDR_TYPE_PRIVATE_BLE_DEVICE
+from .const import AUTO_CALIBRATION_MIN_SCANNER_PAIRS
+from .const import AUTO_CALIBRATION_MIN_SCANNERS
 from .const import BDADDR_TYPE_RANDOM_RESOLVABLE
 from .const import CONF_ATTENUATION
+from .const import CONF_AUTO_CALIBRATION_DEVICE
+from .const import CONF_AUTO_CALIBRATION_ENABLED
+from .const import CONF_AUTO_CALIBRATION_INTERVAL_HOURS
+from .const import CONF_AUTO_CALIBRATION_METHOD
+from .const import CONF_AUTO_CALIBRATION_MODE
+from .const import CONF_AUTO_CALIBRATION_SAMPLES
 from .const import CONF_DEVICES
 from .const import CONF_DEVTRACK_TIMEOUT
 from .const import CONF_IMPORT_MODE
@@ -40,10 +49,19 @@ from .const import CONF_SCANNERS
 from .const import CONF_SMOOTHING_SAMPLES
 from .const import CONF_TRILATERATION_DEBUG
 from .const import CONF_UPDATE_INTERVAL
+from .const import CONF_KALMAN_MAX_VELOCITY
+from .const import CONF_KALMAN_MEASUREMENT_NOISE
+from .const import CONF_KALMAN_PROCESS_NOISE
 from .const import CONFDATA_FLOORS
+from .const import CONFDATA_NODE_FLOORS
 from .const import CONFDATA_ROOMS
 from .const import CONFDATA_SCANNER_POSITIONS
 from .const import DEFAULT_ATTENUATION
+from .const import DEFAULT_AUTO_CALIBRATION_ENABLED
+from .const import DEFAULT_AUTO_CALIBRATION_INTERVAL_HOURS
+from .const import DEFAULT_AUTO_CALIBRATION_METHOD
+from .const import DEFAULT_AUTO_CALIBRATION_MODE
+from .const import DEFAULT_AUTO_CALIBRATION_SAMPLES
 from .const import DEFAULT_DEVTRACK_TIMEOUT
 from .const import DEFAULT_MAX_RADIUS
 from .const import DEFAULT_MAX_VELOCITY
@@ -198,6 +216,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 "selectdevices": "Select Devices",
                 "calibration1_global": "Calibration 1: Global",
                 "calibration2_scanners": "Calibration 2: Scanner RSSI Offsets",
+                "calibration3_auto": "Calibration 3: Auto-Calibrate (Experimental)",
                 "bulk_import": "Bulk Import Map & Scanners",
                 "bulk_export": "Export Map & Scanners (JSON)",
             },
@@ -243,6 +262,25 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 CONF_TRILATERATION_DEBUG,
                 default=self.options.get(CONF_TRILATERATION_DEBUG, DEFAULT_TRILATERATION_DEBUG),
             ): bool,
+            vol.Required(
+                CONF_AUTO_CALIBRATION_ENABLED,
+                default=self.options.get(CONF_AUTO_CALIBRATION_ENABLED, DEFAULT_AUTO_CALIBRATION_ENABLED),
+            ): bool,
+            vol.Required(
+                CONF_AUTO_CALIBRATION_INTERVAL_HOURS,
+                default=self.options.get(CONF_AUTO_CALIBRATION_INTERVAL_HOURS, DEFAULT_AUTO_CALIBRATION_INTERVAL_HOURS),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(value=6, label="6 hours"),
+                        SelectOptionDict(value=12, label="12 hours"),
+                        SelectOptionDict(value=24, label="24 hours"),
+                        SelectOptionDict(value=48, label="48 hours"),
+                        SelectOptionDict(value=168, label="7 days"),
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
         }
 
         return self.async_show_form(step_id="globalopts", data_schema=vol.Schema(data_schema))
@@ -594,11 +632,317 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         # We couldn't match the HA device id to a bermuda device mac.
         return None
 
-    async def async_step_bulk_import(self, user_input=None):
-        """Handle JSON bulk import of scanner positions, floors, and rooms."""
-        from .util import mac_norm
+    async def async_step_calibration3_auto(self, user_input=None):
+        """
+        Auto-calibration using scanner positions and a calibration beacon.
 
-        # Validation schemas
+        This step allows users to automatically calculate per-scanner RSSI offsets
+        by placing a calibration device at a known position and letting Bermuda
+        compute the optimal offsets based on scanner geometry.
+        """
+        from .util import calculate_scanner_offsets_from_scanner_pairs
+        from .util import calculate_scanner_rssi_offsets
+        from .util import get_calibration_quality_metrics  # noqa: F401 - used in _get_auto_calibration_preview
+
+        if user_input is not None:
+            if user_input.get(CONF_SAVE_AND_CLOSE, False):
+                # Determine calibration method
+                calibration_method = user_input.get(
+                    CONF_AUTO_CALIBRATION_METHOD,
+                    DEFAULT_AUTO_CALIBRATION_METHOD,
+                )
+
+                ref_power = self.options.get(CONF_REF_POWER, DEFAULT_REF_POWER)
+                attenuation = self.options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION)
+                new_offsets = {}
+
+                if calibration_method == "scanners":
+                    # Scanner-to-scanner RF ranging calibration
+                    min_samples = self.options.get(
+                        CONF_AUTO_CALIBRATION_SAMPLES,
+                        DEFAULT_AUTO_CALIBRATION_SAMPLES,
+                    )
+
+                    # Collect scanner-to-scanner RSSI data
+                    scanner_pairs_rssi = self.coordinator.collect_scanner_to_scanner_rssi_data(
+                        min_samples=min_samples,
+                    )
+
+                    # Get scanner positions
+                    scanner_positions = self.coordinator.get_scanner_positions_dict()
+
+                    if len(scanner_pairs_rssi) >= AUTO_CALIBRATION_MIN_SCANNER_PAIRS:
+                        new_offsets = calculate_scanner_offsets_from_scanner_pairs(
+                            scanner_pairs_rssi,
+                            scanner_positions,
+                            ref_power,
+                            attenuation,
+                        )
+                    else:
+                        return self.async_show_form(
+                            step_id="calibration3_auto",
+                            data_schema=self._build_auto_calibration_schema(user_input),
+                            description_placeholders={
+                                "status": f"Error: Need at least {AUTO_CALIBRATION_MIN_SCANNER_PAIRS} scanner pairs, found {len(scanner_pairs_rssi)}."
+                            },
+                            errors={"base": "insufficient_scanner_pairs"},
+                        )
+
+                else:  # beacon method
+                    # Beacon-based calibration (original implementation)
+                    calibration_device = user_input.get(CONF_AUTO_CALIBRATION_DEVICE)
+                    
+                    # Validate that beacon device is selected
+                    if not calibration_device:
+                        return self.async_show_form(
+                            step_id="calibration3_auto",
+                            data_schema=self._build_auto_calibration_schema(user_input),
+                            description_placeholders=self._get_auto_calibration_preview(user_input),
+                            errors={"base": "Please select a calibration device for beacon method"},
+                        )
+                    
+                    position_x = user_input.get("position_x", 0.0)
+                    position_y = user_input.get("position_y", 0.0)
+                    position_z = user_input.get("position_z", 0.0)
+                    target_position = (position_x, position_y, position_z)
+
+                    if calibration_device:
+                        # Get the device address from the device registry
+                        device_obj = self._get_bermuda_device_from_registry(calibration_device)
+                        if device_obj is not None:
+                            device_address = device_obj.address
+
+                            # Collect RSSI data
+                            min_samples = self.options.get(
+                                CONF_AUTO_CALIBRATION_SAMPLES,
+                                DEFAULT_AUTO_CALIBRATION_SAMPLES,
+                            )
+                            scanner_rssi_data = self.coordinator.collect_calibration_rssi_data(
+                                device_address,
+                                min_samples=min_samples,
+                            )
+
+                            # Get scanner positions
+                            scanner_positions = self.coordinator.get_scanner_positions_dict()
+
+                            # Calculate offsets
+                            if len(scanner_rssi_data) >= AUTO_CALIBRATION_MIN_SCANNERS:
+                                mode = self.options.get(
+                                    CONF_AUTO_CALIBRATION_MODE,
+                                    DEFAULT_AUTO_CALIBRATION_MODE,
+                                )
+
+                                new_offsets = calculate_scanner_rssi_offsets(
+                                    scanner_rssi_data,
+                                    scanner_positions,
+                                    target_position,
+                                    ref_power,
+                                    attenuation,
+                                    mode,
+                                )
+
+                # Save the new offsets if we calculated any
+                if new_offsets:
+                    self.options.update({CONF_RSSI_OFFSETS: new_offsets})
+                    return await self._update_options()
+
+                # If we get here, something went wrong
+                return self.async_show_form(
+                    step_id="calibration3_auto",
+                    data_schema=self._build_auto_calibration_schema(user_input),
+                    description_placeholders={"status": "Error: Could not calculate offsets. Check configuration."},
+                    errors={"base": "calibration_failed"},
+                )
+
+            # Preview mode - calculate and show metrics but don't save
+            self._last_auto_calibration_input = user_input
+
+        # Build the form
+        return self.async_show_form(
+            step_id="calibration3_auto",
+            data_schema=self._build_auto_calibration_schema(user_input),
+            description_placeholders=self._get_auto_calibration_preview(user_input),
+        )
+
+    def _build_auto_calibration_schema(self, current_input=None):
+        """Build the auto-calibration form schema."""
+        if current_input is None and hasattr(self, "_last_auto_calibration_input"):
+            current_input = self._last_auto_calibration_input
+
+        calibration_method = current_input.get(CONF_AUTO_CALIBRATION_METHOD, DEFAULT_AUTO_CALIBRATION_METHOD) if current_input else DEFAULT_AUTO_CALIBRATION_METHOD
+
+        schema_dict = {
+            vol.Required(
+                CONF_AUTO_CALIBRATION_METHOD,
+                default=calibration_method,
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[
+                        SelectOptionDict(value="beacon", label="Beacon (external device at known position)"),
+                        SelectOptionDict(value="scanners", label="Scanner-to-Scanner RF Ranging"),
+                    ],
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+        }
+
+        # Only show beacon-specific fields if beacon method is selected
+        if calibration_method == "beacon":
+            schema_dict.update({
+                vol.Optional(
+                    CONF_AUTO_CALIBRATION_DEVICE,
+                    default=current_input.get(CONF_AUTO_CALIBRATION_DEVICE) if current_input else vol.UNDEFINED,
+                ): DeviceSelector(DeviceSelectorConfig(integration=DOMAIN)),
+                vol.Optional(
+                    "position_x",
+                    default=current_input.get("position_x", 0.0) if current_input else 0.0,
+                ): vol.Coerce(float),
+                vol.Optional(
+                    "position_y",
+                    default=current_input.get("position_y", 0.0) if current_input else 0.0,
+                ): vol.Coerce(float),
+                vol.Optional(
+                    "position_z",
+                    default=current_input.get("position_z", 0.0) if current_input else 0.0,
+                ): vol.Coerce(float),
+            })
+
+        schema_dict[vol.Optional(CONF_SAVE_AND_CLOSE, default=False)] = vol.Coerce(bool)
+
+        return vol.Schema(schema_dict)
+
+    def _get_auto_calibration_preview(self, user_input) -> dict[str, str]:
+        """Generate preview/status text for auto-calibration."""
+        from .util import get_calibration_quality_metrics
+        from .util import get_scanner_pair_quality_metrics
+
+        if user_input is None:
+            return {
+                "status": (
+                    "**Auto-Calibration Setup**\n\n"
+                    "Choose calibration method:\n"
+                    "- **Beacon**: Use external device at known position\n"
+                    "- **Scanner-to-Scanner**: Use scanners measuring each other (requires broadcasting scanners)\n\n"
+                    "1. Ensure scanner positions are configured (use Bulk Import)\n"
+                    "2. Select calibration method\n"
+                    "3. Click Submit to preview calculated offsets\n"
+                    "4. Check 'Save and Close' to apply the offsets"
+                )
+            }
+
+        # Get calibration method
+        calibration_method = user_input.get(CONF_AUTO_CALIBRATION_METHOD, DEFAULT_AUTO_CALIBRATION_METHOD)
+
+        if calibration_method == "scanners":
+            # Scanner-to-scanner RF ranging preview
+            min_samples = self.options.get(CONF_AUTO_CALIBRATION_SAMPLES, DEFAULT_AUTO_CALIBRATION_SAMPLES)
+            scanner_pairs_rssi = self.coordinator.collect_scanner_to_scanner_rssi_data(min_samples=min_samples)
+            scanner_positions = self.coordinator.get_scanner_positions_dict()
+
+            if len(scanner_pairs_rssi) < AUTO_CALIBRATION_MIN_SCANNER_PAIRS:
+                return {
+                    "status": (
+                        f"**Insufficient Scanner Pairs**\n\n"
+                        f"Found {len(scanner_pairs_rssi)} pairs with data, need {AUTO_CALIBRATION_MIN_SCANNER_PAIRS}.\n\n"
+                        f"**Requirements:**\n"
+                        f"- Scanners must be configured to broadcast BLE advertisements\n"
+                        f"- Scanner positions must be configured\n"
+                        f"- Scanners must be able to receive each other's broadcasts\n\n"
+                        f"Configure your ESPHome proxies with `esp32_ble_tracker` transmit power."
+                    )
+                }
+
+            # Calculate metrics
+            metrics = get_scanner_pair_quality_metrics(scanner_pairs_rssi, scanner_positions)
+
+            # Build preview table
+            status_text = "**Scanner-to-Scanner Calibration Preview**\n\n"
+            status_text += f"Found {len(scanner_pairs_rssi)} scanner pairs:\n\n"
+            status_text += "|Receiver → Transmitter|Distance|Samples|RSSI Median|RSSI StdDev|\n"
+            status_text += "|---|---:|---:|---:|---:|\n"
+
+            for (receiver_addr, transmitter_addr), metric in metrics.items():
+                receiver_name = self.coordinator.devices[receiver_addr].name
+                transmitter_name = self.coordinator.devices[transmitter_addr].name
+                status_text += (
+                    f"|{receiver_name} → {transmitter_name}"
+                    f"|{metric['distance']:.2f}m"
+                    f"|{metric['sample_count']}"
+                    f"|{metric['rssi_median']:.1f} dBm"
+                    f"|{metric['rssi_std']:.1f} dBm|\n"
+                )
+
+            status_text += "\nClick Submit to recalculate, or check 'Save and Close' to apply offsets."
+
+            return {"status": status_text}
+
+        # Beacon method (original implementation)
+        calibration_device = user_input.get(CONF_AUTO_CALIBRATION_DEVICE)
+        if not calibration_device:
+            return {
+                "status": (
+                    "**Beacon Method Setup**\n\n"
+                    "1. Select a calibration device\n"
+                    "2. Enter the device's exact (x, y, z) position in meters\n"
+                    "3. Click Submit to preview calculated offsets\n"
+                    "4. Check 'Save and Close' to apply the offsets"
+                )
+            }
+
+        device_obj = self._get_bermuda_device_from_registry(calibration_device)
+        if device_obj is None:
+            return {"status": "Could not find selected device. Please choose a valid Bermuda device."}
+
+        device_address = device_obj.address
+        position_x = user_input.get("position_x", 0.0)
+        position_y = user_input.get("position_y", 0.0)
+        position_z = user_input.get("position_z", 0.0)
+        target_position = (position_x, position_y, position_z)
+
+        # Collect data
+        min_samples = self.options.get(CONF_AUTO_CALIBRATION_SAMPLES, DEFAULT_AUTO_CALIBRATION_SAMPLES)
+        scanner_rssi_data = self.coordinator.collect_calibration_rssi_data(device_address, min_samples=min_samples)
+        scanner_positions = self.coordinator.get_scanner_positions_dict()
+
+        if len(scanner_rssi_data) < AUTO_CALIBRATION_MIN_SCANNERS:
+            return {
+                "status": (
+                    f"**Insufficient data**\n\n"
+                    f"Found {len(scanner_rssi_data)} scanners with data, need {AUTO_CALIBRATION_MIN_SCANNERS}.\n"
+                    f"Ensure scanners have positions configured and can see the calibration device."
+                )
+            }
+
+        # Calculate metrics
+        metrics = get_calibration_quality_metrics(scanner_rssi_data, scanner_positions, target_position)
+
+        # Build preview table
+        status_text = "**Beacon Calibration Preview**\n\n"
+        status_text += "|Scanner|Distance|Samples|RSSI Median|RSSI StdDev|\n"
+        status_text += "|---|---:|---:|---:|---:|\n"
+
+        for scanner_addr, metric in metrics.items():
+            scanner_name = self.coordinator.devices[scanner_addr].name
+            status_text += (
+                f"|{scanner_name}"
+                f"|{metric['distance']:.2f}m"
+                f"|{metric['sample_count']}"
+                f"|{metric['rssi_median']:.1f} dBm"
+                f"|{metric['rssi_std']:.1f} dBm|\n"
+            )
+
+        status_text += "\nClick Submit to recalculate, or check 'Save and Close' to apply offsets."
+
+        return {"status": status_text}
+
+    async def async_step_bulk_import(self, user_input=None):
+        """Handle JSON or ESPresense YAML bulk import of scanner positions, floors, and rooms.
+
+        Auto-detects format: if input starts with '{' it's parsed as JSON (bermuda format),
+        otherwise it's parsed as YAML (ESPresense format).
+        """
+
+        # Validation schemas for bermuda JSON format
         FLOOR_SCHEMA = vol.Schema({
             vol.Required("id"): str,
             vol.Required("name"): str,
@@ -629,6 +973,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 vol.Length(min=3, max=3),
                 [vol.Coerce(float)],
             ),
+            vol.Optional("floors"): [str],
         }, extra=vol.PREVENT_EXTRA)  # Reject unknown fields
 
         BULK_IMPORT_SCHEMA = vol.Schema({
@@ -640,7 +985,15 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         if user_input is not None:
             # Validate and import
             try:
-                data = json.loads(user_input[CONF_JSON_IMPORT])
+                raw_input = user_input[CONF_JSON_IMPORT].strip()
+
+                # Auto-detect format: JSON starts with '{', YAML doesn't
+                if raw_input.startswith("{"):
+                    data = json.loads(raw_input)
+                else:
+                    # Parse as ESPresense YAML format
+                    data = self._parse_espresense_yaml(raw_input)
+
                 # Validate against BULK_IMPORT_SCHEMA
                 validated_data = BULK_IMPORT_SCHEMA(data)
 
@@ -672,6 +1025,13 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                     step_id="bulk_import",
                     data_schema=self._build_bulk_import_schema(),
                     errors={"base": f"Validation error: {e}"},
+                    description_placeholders=self._build_import_description(),
+                )
+            except Exception as e:  # noqa: BLE001
+                return self.async_show_form(
+                    step_id="bulk_import",
+                    data_schema=self._build_bulk_import_schema(),
+                    errors={"base": f"Import error: {e}"},
                     description_placeholders=self._build_import_description(),
                 )
 
@@ -706,18 +1066,118 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         """Build description placeholders for bulk import form."""
         return {
             "instructions": (
-                "Paste JSON configuration for scanner positions, floors, and rooms.\n\n"
+                "Paste **JSON** (bermuda format) or **YAML** (ESPresense format) configuration.\n\n"
+                "**Format auto-detection:** Input starting with `{` is parsed as JSON, "
+                "otherwise as ESPresense YAML.\n\n"
                 "**Import Mode:**\n"
                 "- **Replace All**: Removes existing data and imports new\n"
                 "- **Merge**: Keeps existing data, updates matching IDs\n\n"
-                "See [scanner_positions.json.example](https://github.com/agittins/bermuda/blob/main/scanner_positions.json.example) for format."
+                "Supports ESPresense `config.yaml` format with floors, rooms, and nodes."
             )
         }
 
+    def _parse_espresense_yaml(self, raw_yaml: str) -> dict:
+        """Parse ESPresense YAML format into bermuda's internal JSON format.
+
+        ESPresense YAML has rooms nested inside floors and nodes matched by name.
+        This converts to bermuda's flat format with explicit floor references.
+
+        ESPresense format:
+            floors:
+              - id: ground
+                name: Ground Floor
+                bounds: [[0,0,0], [10,8,3]]
+                rooms:
+                  - name: Living Room
+                    points: [[0,0], [3,0], [3,4], [0,4]]
+            nodes:
+              - name: Kitchen
+                point: [8, 6.5, 1]
+                floors: ["ground"]
+            filtering:
+              process_noise: 0.01
+              measurement_noise: 0.1
+              max_velocity: 0.5
+        """
+        import yaml  # noqa: PLC0415
+
+        parsed = yaml.safe_load(raw_yaml)
+        if not isinstance(parsed, dict):
+            msg = "YAML must contain a mapping (dict) at the top level"
+            raise ValueError(msg)
+
+        result_floors = []
+        result_rooms = []
+        result_nodes = []
+
+        def _slugify(name: str) -> str:
+            return _re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+        # Parse floors with nested rooms
+        for floor_data in parsed.get("floors", []):
+            floor_id = floor_data.get("id") or _slugify(floor_data.get("name", ""))
+            floor_name = floor_data.get("name", floor_id)
+
+            # Parse bounds - ESPresense uses [[x1,y1,z1], [x2,y2,z2]]
+            bounds = floor_data.get("bounds", [])
+            if bounds and len(bounds) == 2:
+                result_floors.append({
+                    "id": floor_id,
+                    "name": floor_name,
+                    "bounds": [[float(v) for v in bounds[0]], [float(v) for v in bounds[1]]],
+                })
+
+            # Extract rooms nested inside the floor
+            for room_data in floor_data.get("rooms", []):
+                room_name = room_data.get("name", "")
+                room_id = room_data.get("id") or _slugify(room_name)
+                points = room_data.get("points", [])
+
+                if points and len(points) >= 3:
+                    result_rooms.append({
+                        "id": room_id,
+                        "name": room_name,
+                        "floor": floor_id,
+                        "area_id": room_id,  # Default area_id to room_id
+                        "points": [[float(v) for v in p] for p in points],
+                    })
+
+        # Parse nodes - ESPresense uses name-based matching
+        for node_data in parsed.get("nodes", []):
+            node_name = node_data.get("name", "")
+            node_id = node_data.get("id", node_name)  # Use id if present, else name
+            point = node_data.get("point", [])
+            floors = node_data.get("floors", [])
+
+            if point and len(point) >= 3:
+                result_nodes.append({
+                    "id": node_id,
+                    "name": node_name,
+                    "point": [float(v) for v in point[:3]],
+                    "floors": floors,
+                })
+
+        # Store filtering settings if present
+        filtering = parsed.get("filtering", {})
+        if filtering:
+            # These will be applied in _apply_bulk_import
+            result = {
+                "floors": result_floors,
+                "rooms": result_rooms,
+                "nodes": result_nodes,
+                "_filtering": filtering,
+            }
+        else:
+            result = {
+                "floors": result_floors,
+                "rooms": result_rooms,
+                "nodes": result_nodes,
+            }
+
+        return result
+
     def _validate_bulk_import(self, data: dict) -> dict[str, str] | None:
         """Validate bulk import data. Returns error dict or None."""
-        from .util import mac_norm
-
         errors = {}
 
         # Check floor references in rooms
@@ -738,22 +1198,19 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             errors["base"] = "Duplicate room IDs found"
             return errors
 
-        # Normalize and check scanner MACs
-        scanner_macs = []
-        for node in data.get("nodes", []):
-            try:
-                normalized = mac_norm(node["id"])
-                if not normalized:
-                    errors["base"] = f"Invalid MAC address format: {node['id']}"
-                    return errors
-                scanner_macs.append(normalized)
-            except (KeyError, TypeError, ValueError):
-                errors["base"] = f"Invalid MAC address format: {node['id']}"
-                return errors
-
-        if len(scanner_macs) != len(set(scanner_macs)):
-            errors["base"] = "Duplicate scanner MAC addresses found"
+        # Check for duplicate node IDs
+        node_ids = [n["id"] for n in data.get("nodes", [])]
+        if len(node_ids) != len(set(node_ids)):
+            errors["base"] = "Duplicate node IDs found"
             return errors
+
+        # Validate node floor references if floors data is present
+        if floor_ids:
+            for node in data.get("nodes", []):
+                for nf in node.get("floors", []):
+                    if nf not in floor_ids:
+                        errors["base"] = f"Node '{node['id']}' references unknown floor '{nf}'"
+                        return errors
 
         return None
 
@@ -761,20 +1218,36 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         """Apply validated bulk import data to config entry."""
         from .util import mac_norm
 
+        def _normalize_node_id(node_id: str) -> str:
+            """Try to normalize as MAC address, fall back to raw ID."""
+            try:
+                normalized = mac_norm(node_id)
+                if normalized:
+                    return normalized
+            except (TypeError, ValueError):
+                pass
+            # Not a MAC address (e.g. ESPresense name-based ID) - use as-is
+            return node_id
+
         if mode == "replace":
             # Replace all data
             self.options[CONFDATA_FLOORS] = data.get("floors", [])
             self.options[CONFDATA_ROOMS] = data.get("rooms", [])
 
-            # Scanner positions as dict keyed by normalized MAC
+            # Scanner positions keyed by normalized MAC or name-based ID
             positions = {}
+            node_floors = {}
             for node in data.get("nodes", []):
-                mac = mac_norm(node["id"])
-                positions[mac] = {
+                key = _normalize_node_id(node["id"])
+                positions[key] = {
                     "name": node.get("name"),
                     "point": node["point"],
                 }
+                if node.get("floors"):
+                    node_floors[key] = node["floors"]
+
             self.options[CONFDATA_SCANNER_POSITIONS] = positions
+            self.options[CONFDATA_NODE_FLOORS] = node_floors
 
         else:  # mode == "merge"
             # Merge floors (update existing, add new)
@@ -791,13 +1264,28 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
 
             # Same for scanner positions
             existing_positions = self.options.get(CONFDATA_SCANNER_POSITIONS, {})
+            existing_node_floors = self.options.get(CONFDATA_NODE_FLOORS, {})
             for node in data.get("nodes", []):
-                mac = mac_norm(node["id"])
-                existing_positions[mac] = {
+                key = _normalize_node_id(node["id"])
+                existing_positions[key] = {
                     "name": node.get("name"),
                     "point": node["point"],
                 }
+                if node.get("floors"):
+                    existing_node_floors[key] = node["floors"]
+
             self.options[CONFDATA_SCANNER_POSITIONS] = existing_positions
+            self.options[CONFDATA_NODE_FLOORS] = existing_node_floors
+
+        # Apply filtering settings from ESPresense YAML if present
+        filtering = data.get("_filtering", {})
+        if filtering:
+            if "process_noise" in filtering:
+                self.options[CONF_KALMAN_PROCESS_NOISE] = float(filtering["process_noise"])
+            if "measurement_noise" in filtering:
+                self.options[CONF_KALMAN_MEASUREMENT_NOISE] = float(filtering["measurement_noise"])
+            if "max_velocity" in filtering:
+                self.options[CONF_KALMAN_MAX_VELOCITY] = float(filtering["max_velocity"])
 
     async def async_step_bulk_export(self, user_input=None):
         """Export current scanner positions as JSON."""
@@ -810,12 +1298,16 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
 
         # Add scanner positions from config entry or live devices
         positions = self.options.get(CONFDATA_SCANNER_POSITIONS, {})
+        node_floors_data = self.options.get(CONFDATA_NODE_FLOORS, {})
         for mac, pos_data in positions.items():
-            export_data["nodes"].append({
+            node_entry = {
                 "id": mac.upper(),
                 "name": pos_data.get("name", ""),
                 "point": pos_data["point"],
-            })
+            }
+            if mac in node_floors_data:
+                node_entry["floors"] = node_floors_data[mac]
+            export_data["nodes"].append(node_entry)
 
         # Also include scanners with positions not in config entry
         for device in self.coordinator.devices.values():

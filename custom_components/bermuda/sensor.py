@@ -24,7 +24,6 @@ from .const import SIGNAL_DEVICE_NEW
 from .const import SIGNAL_SCANNERS_CHANGED
 from .entity import BermudaEntity
 from .entity import BermudaGlobalEntity
-from .trilateration import find_room_for_position
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -80,7 +79,7 @@ async def async_setup_entry(
             entities.append(BermudaSensorRssi(coordinator, entry, address))
             entities.append(BermudaSensorAreaLastSeen(coordinator, entry, address))
             entities.append(BermudaSensorAreaSwitchReason(coordinator, entry, address))
-            entities.append(BermudaSensorPosition(coordinator, entry, address))
+            # Position data now available as attributes on Area sensor to reduce database writes
 
             # _LOGGER.debug("Sensor received new_device signal for %s", address)
             # We set update before add to False because we are being
@@ -234,6 +233,64 @@ class BermudaSensor(BermudaEntity, SensorEntity):
             attribs["floor_id"] = self._device.floor_id
             attribs["floor_name"] = self._device.floor_name
             attribs["floor_level"] = self._device.floor_level
+
+            # Add position data as attributes instead of separate entity
+            # This reduces database writes significantly
+            if self._device.calculated_position is not None:
+                x, y, z = self._device.calculated_position
+                attribs["position_x"] = round(x, 3)
+                attribs["position_y"] = round(y, 3)
+                attribs["position_z"] = round(z, 3)
+                attribs["position"] = f"({x:.2f}, {y:.2f}, {z:.2f})"
+
+                if self._device.position_confidence is not None:
+                    attribs["position_confidence"] = round(self._device.position_confidence, 1)
+
+                if self._device.position_method is not None:
+                    attribs["position_method"] = self._device.position_method
+
+                if self._device.position_error is not None:
+                    attribs["position_error"] = round(self._device.position_error, 3)
+
+                if self._device.position_correlation is not None:
+                    attribs["position_correlation"] = round(self._device.position_correlation, 3)
+
+                # Velocity from Kalman filter
+                if self._device._kalman_location is not None:
+                    attribs["position_velocity"] = round(self._device._kalman_location.speed, 3)
+
+                # Count scanners contributing to position
+                if hasattr(self._device, "adverts"):
+                    scanner_count = sum(
+                        1
+                        for advert in self._device.adverts.values()
+                        if (scanner := self.coordinator.devices.get(advert.scanner_address))
+                        and scanner.is_scanner
+                        and scanner.position is not None
+                        and advert.rssi_distance is not None
+                        and advert.rssi_distance > 0
+                    )
+                    attribs["position_scanner_count"] = scanner_count
+
+                # Room info from trilateration
+                if self._device.position_room_id:
+                    attribs["position_room_id"] = self._device.position_room_id
+                    # Look up room name
+                    room = next(
+                        (
+                            r
+                            for r in self.coordinator.map_rooms.values()
+                            if r.get("area_id") == self._device.position_room_id
+                            or r.get("id") == self._device.position_room_id
+                        ),
+                        None,
+                    ) if self.coordinator.map_rooms else None
+                    if room:
+                        attribs["position_room_name"] = room.get("name", self._device.position_room_id)
+
+                if self._device.position_floor_id:
+                    attribs["position_floor_id"] = self._device.position_floor_id
+
         attribs["current_mac"] = current_mac
 
         return attribs
@@ -594,125 +651,5 @@ class BermudaVisibleDeviceCount(BermudaGlobalSensor):
         return "Visible device count"
 
 
-class BermudaSensorPosition(BermudaSensor):
-    """Position sensor showing trilateration-calculated (x, y, z) coordinates."""
-
-    # No state_class since the state is a string representation of coordinates
-    # Individual x, y, z values are available in extra_state_attributes
-    _attr_icon = "mdi:map-marker"
-
-    @property
-    def unique_id(self):
-        """Uniquely identify this sensor."""
-        return f"{self._device.unique_id}_position"
-
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return "Position"
-
-    @property
-    def native_value(self) -> str | None:
-        """Return the position as a formatted string."""
-        if self._device.calculated_position is None:
-            return self._cached_ratelimit(None)
-
-        x, y, z = self._device.calculated_position
-        return self._cached_ratelimit(f"({x:.2f}, {y:.2f}, {z:.2f})")
-
-    @property
-    def extra_state_attributes(self):
-        """Return additional attributes for the sensor."""
-        if self._device.calculated_position is None:
-            return {}
-
-        x, y, z = self._device.calculated_position
-        attrs = {
-            "x": round(x, 3),
-            "y": round(y, 3),
-            "z": round(z, 3),
-        }
-
-        if self._device.position_confidence is not None:
-            attrs["confidence"] = round(self._device.position_confidence, 1)
-
-        if self._device.position_method is not None:
-            attrs["method"] = self._device.position_method
-
-        # Count how many scanners contributed to this position
-        if hasattr(self._device, "adverts"):
-            scanner_count = sum(
-                1
-                for advert in self._device.adverts.values()
-                if (scanner := self.coordinator.devices.get(advert.scanner_address))
-                and scanner.is_scanner
-                and scanner.position is not None
-                and advert.rssi_distance is not None
-                and advert.rssi_distance > 0
-            )
-            attrs["scanner_count"] = scanner_count
-
-        # Add room detection info, caching results on the device to avoid
-        # recomputing for every attribute access when the position has not changed.
-        if self.coordinator.map_rooms:
-            current_position = (x, y, z)
-            cached_position = getattr(self._device, "room_position_coords", None)
-            cached_room_id = getattr(self._device, "room_id", None)
-            cached_room_name = getattr(self._device, "room_name", None)
-            cached_floor_id = getattr(self._device, "floor_id", None)
-
-            room_id = cached_room_id
-            room_name = cached_room_name
-            floor_id = cached_floor_id
-
-            # Recalculate only if we have no cached room info or the position changed
-            if cached_position != current_position or room_id is None:
-
-                room_id = find_room_for_position(
-                    current_position,
-                    list(self.coordinator.map_rooms.values()),
-                    list(self.coordinator.map_floors.values())
-                    if self.coordinator.map_floors
-                    else None,
-                )
-
-                room_name = None
-                floor_id = None
-
-                if room_id:
-                    room = next(
-                        (
-                            r
-                            for r in self.coordinator.map_rooms.values()
-                            if r.get("area_id") == room_id or r.get("id") == room_id
-                        ),
-                        None,
-                    )
-                    if room:
-                        room_name = room.get("name", room_id)
-                        floor_id = room.get("floor")
-
-                # Cache the latest position and room info on the device
-                setattr(self._device, "room_position_coords", current_position)
-                setattr(self._device, "room_id", room_id)
-                setattr(self._device, "room_name", room_name)
-                setattr(self._device, "floor_id", floor_id)
-
-            if room_id:
-                attrs["room_id"] = room_id
-                if room_name is not None:
-                    attrs["room_name"] = room_name
-                if floor_id is not None:
-                    attrs["floor_id"] = floor_id
-
-        return attrs
-
-    @property
-    def entity_registry_enabled_default(self) -> bool:
-        """Position sensor enabled by default only if trilateration is configured."""
-        # Enable if any scanners have positions configured
-        return any(
-            scanner.position is not None
-            for scanner in self.coordinator.devices.values()
-            if scanner.is_scanner
-        )
+# BermudaSensorPosition class removed - position data now available as attributes
+# on the Area sensor to significantly reduce database writes

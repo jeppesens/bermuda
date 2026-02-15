@@ -352,3 +352,366 @@ def clean_charbuf(instring: str | None) -> str:
     if instring is not None:
         return instring.strip(" \t\r\n\x00").split("\0")[0]
     return ""
+
+
+def calculate_distance_from_position(
+    scanner_pos: tuple[float, float, float],
+    target_pos: tuple[float, float, float],
+) -> float:
+    """
+    Calculate 3D Euclidean distance between scanner and target position.
+
+    Args:
+        scanner_pos: (x, y, z) coordinates of scanner in meters
+        target_pos: (x, y, z) coordinates of target in meters
+
+    Returns:
+        Distance in meters
+    """
+    return (
+        (scanner_pos[0] - target_pos[0]) ** 2
+        + (scanner_pos[1] - target_pos[1]) ** 2
+        + (scanner_pos[2] - target_pos[2]) ** 2
+    ) ** 0.5
+
+
+def calculate_scanner_rssi_offsets(
+    scanner_rssi_data: dict[str, list[float]],
+    scanner_positions: dict[str, tuple[float, float, float]],
+    target_position: tuple[float, float, float],
+    ref_power: float,
+    attenuation: float,
+    mode: str = "offsets_only",
+) -> dict[str, float]:
+    """
+    Calculate per-scanner RSSI offsets using a calibration beacon at known position.
+
+    This implements MVP auto-calibration: given a beacon at a known location and
+    multiple scanners with known positions, compute RSSI offsets that normalize
+    scanner sensitivity differences.
+
+    Algorithm:
+    1. For each scanner, compute actual distance from scanner to beacon using positions
+    2. Compute expected RSSI using the log-distance path-loss model with current ref_power/attenuation
+    3. Compute median observed RSSI from samples
+    4. RSSI offset = expected_rssi - observed_rssi (additive correction)
+
+    Args:
+        scanner_rssi_data: Dict mapping scanner_address -> list of RSSI samples (floats)
+        scanner_positions: Dict mapping scanner_address -> (x, y, z) position in meters
+        target_position: (x, y, z) position of calibration beacon in meters
+        ref_power: Current global ref_power parameter (dBm)
+        attenuation: Current global attenuation parameter (path loss exponent)
+        mode: "offsets_only" (default) or "full" (future: also fit ref_power/attenuation)
+
+    Returns:
+        Dict mapping scanner_address -> rssi_offset (dBm, additive)
+        Empty dict if insufficient data
+
+    Raises:
+        ValueError: If mode is unsupported or inputs are invalid
+    """
+    import math
+
+    if mode not in ("offsets_only", "full"):
+        raise ValueError(f"Unsupported calibration mode: {mode}")
+
+    if mode == "full":
+        raise NotImplementedError("Full calibration mode (fitting ref_power/attenuation) not yet implemented")
+
+    offsets = {}
+
+    # Validate we have at least 2 scanners with data and positions
+    common_scanners = set(scanner_rssi_data.keys()) & set(scanner_positions.keys())
+    if len(common_scanners) < 2:
+        return {}
+
+    for scanner_addr in common_scanners:
+        rssi_samples = scanner_rssi_data[scanner_addr]
+        scanner_pos = scanner_positions[scanner_addr]
+
+        # Need enough samples for robust median
+        if len(rssi_samples) < 10:
+            continue
+
+        # Calculate actual distance from scanner to beacon
+        distance = calculate_distance_from_position(scanner_pos, target_position)
+
+        # Prevent division issues with very small distances
+        if distance < 0.1:
+            continue
+
+        # Calculate expected RSSI at this distance using current model
+        # Formula: rssi_expected = ref_power - 10 * attenuation * log10(distance)
+        expected_rssi = ref_power - 10 * attenuation * math.log10(distance)
+
+        # Get robust observed RSSI (median filters outliers)
+        observed_rssi = statistics.median(rssi_samples)
+
+        # Offset is the correction needed: offset + observed = expected
+        # So offset = expected - observed
+        offset = expected_rssi - observed_rssi
+
+        offsets[scanner_addr] = offset
+
+    return offsets
+
+
+def get_calibration_quality_metrics(
+    scanner_rssi_data: dict[str, list[float]],
+    scanner_positions: dict[str, tuple[float, float, float]],
+    target_position: tuple[float, float, float],
+) -> dict[str, dict[str, float]]:
+    """
+    Calculate quality metrics for calibration data to help user assess reliability.
+
+    Returns per-scanner metrics including:
+    - sample_count: Number of RSSI samples
+    - rssi_median: Median RSSI value (dBm)
+    - rssi_std: Standard deviation of RSSI (dBm, indicates stability)
+    - distance: Physical distance from scanner to beacon (meters)
+
+    Args:
+        scanner_rssi_data: Dict mapping scanner_address -> list of RSSI samples
+        scanner_positions: Dict mapping scanner_address -> (x, y, z) position
+        target_position: (x, y, z) position of calibration beacon
+
+    Returns:
+        Dict mapping scanner_address -> metrics dict
+    """
+    metrics = {}
+
+    common_scanners = set(scanner_rssi_data.keys()) & set(scanner_positions.keys())
+
+    for scanner_addr in common_scanners:
+        rssi_samples = scanner_rssi_data[scanner_addr]
+        scanner_pos = scanner_positions[scanner_addr]
+
+        if len(rssi_samples) < 2:
+            continue
+
+        distance = calculate_distance_from_position(scanner_pos, target_position)
+
+        metrics[scanner_addr] = {
+            "sample_count": len(rssi_samples),
+            "rssi_median": statistics.median(rssi_samples),
+            "rssi_std": statistics.stdev(rssi_samples) if len(rssi_samples) > 1 else 0.0,
+            "distance": distance,
+        }
+
+    return metrics
+
+
+def calculate_scanner_offsets_from_scanner_pairs(
+    scanner_pairs_rssi: dict[tuple[str, str], list[float]],
+    scanner_positions: dict[str, tuple[float, float, float]],
+    ref_power: float,
+    attenuation: float,
+) -> dict[str, float]:
+    """
+    Calculate per-scanner RSSI offsets using scanner-to-scanner RF ranging.
+
+    This algorithm uses scanners measuring each other instead of an external beacon.
+    For each scanner pair (A, B) where scanner A receives from scanner B:
+    1. Calculate actual distance between scanners using their positions
+    2. Calculate expected RSSI using log-distance model
+    3. Get median observed RSSI
+    4. Solve for per-scanner offsets that minimize total error
+
+    The offset model:
+    - Each scanner has a TX offset (when transmitting) and RX offset (when receiving)
+    - For simplicity, we assume TX_offset = RX_offset for each scanner
+    - observed_RSSI(A receives from B) = expected_RSSI - offset_B + offset_A
+      (B's transmission is affected by its offset, A's reception adds its offset)
+
+    Algorithm:
+    - Set one scanner as reference (offset = 0)
+    - For each other scanner, calculate offset from all measurements involving it
+    - Use weighted average across multiple pair measurements
+
+    Args:
+        scanner_pairs_rssi: Dict mapping (receiver_addr, transmitter_addr) -> RSSI samples
+        scanner_positions: Dict mapping scanner_addr -> (x, y, z) position
+        ref_power: Global ref_power parameter (dBm)
+        attenuation: Global attenuation parameter (path loss exponent)
+
+    Returns:
+        Dict mapping scanner_address -> rssi_offset (dBm, additive)
+        Empty dict if insufficient data
+
+    Raises:
+        ValueError: If inputs are invalid
+    """
+    import math
+
+    if not scanner_pairs_rssi:
+        return {}
+
+    # Get all scanners involved in measurements
+    all_scanners = set()
+    for (receiver, transmitter) in scanner_pairs_rssi.keys():
+        all_scanners.add(receiver)
+        all_scanners.add(transmitter)
+
+    # Filter to only scanners with known positions
+    scanners_with_positions = {s for s in all_scanners if s in scanner_positions}
+
+    if len(scanners_with_positions) < 2:
+        return {}
+
+    # Choose reference scanner (most measurements, or alphabetically first)
+    reference_scanner = min(scanners_with_positions)
+
+    # Calculate offsets for each scanner relative to reference
+    scanner_offsets = {reference_scanner: 0.0}
+
+    # For each scanner, collect all measurements involving it
+    for scanner_addr in scanners_with_positions:
+        if scanner_addr == reference_scanner:
+            continue
+
+        offset_estimates = []
+
+        # Case 1: This scanner received from reference scanner
+        pair_key_rx = (scanner_addr, reference_scanner)
+        if pair_key_rx in scanner_pairs_rssi:
+            rssi_samples = scanner_pairs_rssi[pair_key_rx]
+            if len(rssi_samples) >= 5:
+                # Calculate expected distance
+                pos1 = scanner_positions[scanner_addr]
+                pos2 = scanner_positions[reference_scanner]
+                distance = calculate_distance_from_position(pos1, pos2)
+
+                if distance >= 0.1:  # Avoid division issues
+                    # Expected RSSI at this distance
+                    expected_rssi = ref_power - 10 * attenuation * math.log10(distance)
+
+                    # Observed RSSI (median)
+                    observed_rssi = statistics.median(rssi_samples)
+
+                    # observed = expected - offset_transmitter + offset_receiver
+                    # observed = expected - offset_ref + offset_scanner
+                    # observed = expected - 0 + offset_scanner
+                    # offset_scanner = observed - expected
+                    offset = observed_rssi - expected_rssi
+                    offset_estimates.append(offset)
+
+        # Case 2: Reference scanner received from this scanner
+        pair_key_tx = (reference_scanner, scanner_addr)
+        if pair_key_tx in scanner_pairs_rssi:
+            rssi_samples = scanner_pairs_rssi[pair_key_tx]
+            if len(rssi_samples) >= 5:
+                pos1 = scanner_positions[reference_scanner]
+                pos2 = scanner_positions[scanner_addr]
+                distance = calculate_distance_from_position(pos1, pos2)
+
+                if distance >= 0.1:
+                    expected_rssi = ref_power - 10 * attenuation * math.log10(distance)
+                    observed_rssi = statistics.median(rssi_samples)
+
+                    # observed = expected - offset_transmitter + offset_receiver
+                    # observed = expected - offset_scanner + offset_ref
+                    # observed = expected - offset_scanner + 0
+                    # offset_scanner = expected - observed
+                    offset = expected_rssi - observed_rssi
+                    offset_estimates.append(offset)
+
+        # Case 3: This scanner and another non-reference scanner
+        for other_scanner in scanners_with_positions:
+            if other_scanner in (scanner_addr, reference_scanner):
+                continue
+
+            # This scanner received from other
+            pair_key = (scanner_addr, other_scanner)
+            if pair_key in scanner_pairs_rssi:
+                rssi_samples = scanner_pairs_rssi[pair_key]
+                if len(rssi_samples) >= 5 and other_scanner in scanner_offsets:
+                    pos1 = scanner_positions[scanner_addr]
+                    pos2 = scanner_positions[other_scanner]
+                    distance = calculate_distance_from_position(pos1, pos2)
+
+                    if distance >= 0.1:
+                        expected_rssi = ref_power - 10 * attenuation * math.log10(distance)
+                        observed_rssi = statistics.median(rssi_samples)
+
+                        # observed = expected - offset_transmitter + offset_receiver
+                        # observed = expected - offset_other + offset_scanner
+                        # offset_scanner = observed - expected + offset_other
+                        other_offset = scanner_offsets[other_scanner]
+                        offset = observed_rssi - expected_rssi + other_offset
+                        offset_estimates.append(offset)
+
+            # Other scanner received from this one
+            pair_key = (other_scanner, scanner_addr)
+            if pair_key in scanner_pairs_rssi:
+                rssi_samples = scanner_pairs_rssi[pair_key]
+                if len(rssi_samples) >= 5 and other_scanner in scanner_offsets:
+                    pos1 = scanner_positions[other_scanner]
+                    pos2 = scanner_positions[scanner_addr]
+                    distance = calculate_distance_from_position(pos1, pos2)
+
+                    if distance >= 0.1:
+                        expected_rssi = ref_power - 10 * attenuation * math.log10(distance)
+                        observed_rssi = statistics.median(rssi_samples)
+
+                        # observed = expected - offset_transmitter + offset_receiver
+                        # observed = expected - offset_scanner + offset_other
+                        # offset_scanner = expected - observed + offset_other
+                        other_offset = scanner_offsets[other_scanner]
+                        offset = expected_rssi - observed_rssi + other_offset
+                        offset_estimates.append(offset)
+
+        # Calculate average offset from all estimates
+        if offset_estimates:
+            scanner_offsets[scanner_addr] = statistics.mean(offset_estimates)
+
+    # Only return if we have at least 2 scanners calibrated
+    if len(scanner_offsets) < 2:
+        return {}
+
+    return scanner_offsets
+
+
+def get_scanner_pair_quality_metrics(
+    scanner_pairs_rssi: dict[tuple[str, str], list[float]],
+    scanner_positions: dict[str, tuple[float, float, float]],
+) -> dict[tuple[str, str], dict[str, float]]:
+    """
+    Calculate quality metrics for scanner-to-scanner calibration data.
+
+    Returns per-pair metrics to help user assess data reliability.
+
+    Args:
+        scanner_pairs_rssi: Dict mapping (receiver, transmitter) -> RSSI samples
+        scanner_positions: Dict mapping scanner_address -> (x, y, z) position
+
+    Returns:
+        Dict mapping (receiver, transmitter) -> metrics dict with:
+        - sample_count: Number of RSSI samples
+        - rssi_median: Median RSSI value (dBm)
+        - rssi_std: Standard deviation of RSSI (dBm)
+        - distance: Physical distance between scanners (meters)
+        - receiver_name: Name of receiving scanner
+        - transmitter_name: Name of transmitting scanner
+    """
+    metrics = {}
+
+    for (receiver_addr, transmitter_addr), rssi_samples in scanner_pairs_rssi.items():
+        if len(rssi_samples) < 2:
+            continue
+
+        if receiver_addr not in scanner_positions or transmitter_addr not in scanner_positions:
+            continue
+
+        receiver_pos = scanner_positions[receiver_addr]
+        transmitter_pos = scanner_positions[transmitter_addr]
+        distance = calculate_distance_from_position(receiver_pos, transmitter_pos)
+
+        metrics[(receiver_addr, transmitter_addr)] = {
+            "sample_count": len(rssi_samples),
+            "rssi_median": statistics.median(rssi_samples),
+            "rssi_std": statistics.stdev(rssi_samples) if len(rssi_samples) > 1 else 0.0,
+            "distance": distance,
+        }
+
+    return metrics

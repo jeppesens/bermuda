@@ -115,7 +115,17 @@ class BermudaDevice(dict):
         self.calculated_position: tuple[float, float, float] | None = None  # (x, y, z) for tracked devices
         self.position_confidence: float | None = None  # Confidence percentage (0-100)
         self.position_timestamp: float | None = None  # When position was last calculated
-        self.position_method: str | None = None  # "1-scanner", "2-scanner", "3-scanner", "4+scanner"
+        self.position_method: str | None = None  # "nadaraya_watson", "nearest_node"
+        self.position_error: float | None = None  # Weighted residual error
+        self.position_correlation: float | None = None  # Pearson correlation
+        self.position_room_id: str | None = None  # Room detected from position
+        self.position_floor_id: str | None = None  # Floor detected from position
+
+        # Per-device Kalman filter for position smoothing (lazily initialized)
+        self._kalman_location = None  # KalmanLocation instance
+
+        # For scanners: which floors this node serves (from ESPresense YAML config)
+        self.node_floors: list[str] | None = None
 
         self.floor: fr.FloorEntry | None = None
         self.floor_id: str | None = None

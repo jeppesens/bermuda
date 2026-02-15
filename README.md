@@ -184,6 +184,80 @@ trilateration_use_variance_weighting: true  # weight scanners by signal quality
 
 See [the Wiki](https://github.com/agittins/bermuda/wiki/) for detailed setup guides and troubleshooting.
 
+## Recommended ESPHome Scanner Configuration
+
+For reliable BLE proxy operation, your ESPHome configs should include three critical stability features: **API-controlled scan lifecycle**, **ESP-IDF version pinning**, and **safe mode**. Without these, scanners can freeze or become unresponsive after network interruptions.
+
+### Minimal recommended config:
+
+```yaml
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    version: 5.3.2  # pin to avoid known BLE issues in 5.5.x
+    sdkconfig_options:
+      CONFIG_BT_BLE_42_FEATURES_SUPPORTED: y
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "10"
+
+logger:
+  baud_rate: 0  # free CPU/memory by disabling serial logging
+  level: WARN
+
+api:
+  encryption:
+    key: ${api_key}
+  on_client_connected:
+    - esp32_ble_tracker.start_scan:
+        continuous: true
+  on_client_disconnected:
+    if:
+      condition:
+        not:
+          api.connected:
+      then:
+        - esp32_ble_tracker.stop_scan:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: NONE
+
+esp32_ble_tracker:
+  scan_parameters:
+    continuous: false  # only scan when HA API is connected
+    active: true
+    interval: 320ms
+    window: 300ms   # ~94% duty cycle for maximum BLE coverage
+
+bluetooth_proxy:
+  active: true
+
+safe_mode:  # allows OTA recovery if firmware crashes repeatedly
+```
+
+### Why these settings matter:
+
+- **`continuous: false` + API lifecycle events**: Prevents the ESP32 from running BLE scans before WiFi is connected. Without this, a network disruption (WiFi AP restart, HA restart) can leave the scanner running BLE with no WiFi, exhausting resources until it becomes unresponsive.
+- **`version: 5.3.2`** (ESP-IDF pin): ESP-IDF 5.5.x has known issues causing BLE proxy freezes on classic ESP32 boards. Version 5.3.2 was the stable default through ESPHome 2025.6–2025.10.
+- **`safe_mode:`**: If the device crashes repeatedly, it boots into a minimal safe mode where OTA updates still work — no need to physically access the device with a USB cable.
+- **`power_save_mode: NONE`**: Disables WiFi power saving for consistent connectivity.
+- **`interval: 320ms` / `window: 300ms`**: 94% BLE listen duty cycle (vs the default ~9%), dramatically improving device detection.
+- **`baud_rate: 0`**: Disabling serial UART logging frees CPU cycles and memory for BLE operations.
+- **`CONFIG_BT_BLE_42_FEATURES_SUPPORTED: y`**: Enables BLE 4.2 features for better bluetooth performance on original ESP32 boards.
+
+### Board recommendations:
+
+- **ESP32-S3**: Best choice — dual-core, BLE 5.0, good memory. Boards like M5Stack Atom S3 work well.
+- **ESP32 (original)**: Dual-core, reliable with the config above. Most common and cheapest option (D1-Mini32, etc).
+- **ESP32-C3**: Single-core, can be problematic under load. If using C3, the API lifecycle control above is especially important.
+- **ESP32-C5/C6**: Newer chips with BLE 5.0 and WiFi 6. Good performance but less community testing.
+
+### Also see:
+
+- [agittins/bermuda-proxies](https://github.com/agittins/bermuda-proxies) — Official ESPHome packages for Bermuda with ready-to-use configs
+- [ESPHome Bluetooth Proxy docs](https://esphome.io/components/bluetooth_proxy.html)
+
 ## What you need:
 
 - Home Assistant. The current release of Bermuda requires at least ![haminverbadge]

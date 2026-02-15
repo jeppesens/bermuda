@@ -18,6 +18,8 @@ from bluetooth_data_tools import monotonic_time_coarse
 from habluetooth import BaseHaScanner
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.api import _get_manager
+from homeassistant.components.persistent_notification import async_create as async_create_notification
+from homeassistant.components.persistent_notification import async_dismiss as async_dismiss_notification
 from homeassistant.const import MAJOR_VERSION as HA_VERSION_MAJ
 from homeassistant.const import MINOR_VERSION as HA_VERSION_MIN
 from homeassistant.const import Platform
@@ -34,6 +36,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import floor_registry as fr
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.device_registry import EVENT_DEVICE_REGISTRY_UPDATED
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.device_registry import EventDeviceRegistryUpdatedData
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -46,9 +49,15 @@ from .const import _LOGGER
 from .const import _LOGGER_SPAM_LESS
 from .const import ADDR_TYPE_PRIVATE_BLE_DEVICE
 from .const import AREA_MAX_AD_AGE
+from .const import AUTO_CALIBRATION_MIN_SCANNER_PAIRS
 from .const import BDADDR_TYPE_NOT_MAC48
 from .const import BDADDR_TYPE_RANDOM_RESOLVABLE
+from .const import CALIBRATION_NOTIFICATION_COOLDOWN
 from .const import CONF_ATTENUATION
+from .const import CONF_AUTO_CALIBRATION_ENABLED
+from .const import CONF_AUTO_CALIBRATION_INTERVAL_HOURS
+from .const import CONF_AUTO_CALIBRATION_METHOD
+from .const import CONF_AUTO_CALIBRATION_SAMPLES
 from .const import CONF_DEVICES
 from .const import CONF_DEVTRACK_TIMEOUT
 from .const import CONF_ENABLE_TRILATERATION
@@ -63,10 +72,16 @@ from .const import CONF_TRILATERATION_AREA_MIN_CONFIDENCE
 from .const import CONF_TRILATERATION_DEBUG
 from .const import CONF_TRILATERATION_OVERRIDE_AREA
 from .const import CONF_UPDATE_INTERVAL
+from .const import CONFDATA_CALIBRATION_QUALITY
+from .const import CONFDATA_CALIBRATION_STATUS
 from .const import CONFDATA_FLOORS
+from .const import CONFDATA_LAST_CALIBRATION_TIME
 from .const import CONFDATA_ROOMS
 from .const import CONFDATA_SCANNER_POSITIONS
 from .const import DEFAULT_ATTENUATION
+from .const import DEFAULT_AUTO_CALIBRATION_ENABLED
+from .const import DEFAULT_AUTO_CALIBRATION_INTERVAL_HOURS
+from .const import DEFAULT_AUTO_CALIBRATION_METHOD
 from .const import DEFAULT_DEVTRACK_TIMEOUT
 from .const import DEFAULT_MAX_RADIUS
 from .const import DEFAULT_MAX_TRILATERATION_SCANNERS
@@ -80,6 +95,17 @@ from .const import DOMAIN_PRIVATE_BLE_DEVICE
 from .const import METADEVICE_IBEACON_DEVICE
 from .const import METADEVICE_TYPE_IBEACON_SOURCE
 from .const import METADEVICE_TYPE_PRIVATE_BLE_SOURCE
+from .const import NOTIFICATION_ID_CALIBRATION_INSUFFICIENT
+from .const import NOTIFICATION_ID_CALIBRATION_NO_BROADCASTING
+from .const import CONF_KALMAN_MAX_VELOCITY
+from .const import CONF_KALMAN_MEASUREMENT_NOISE
+from .const import CONF_KALMAN_PROCESS_NOISE
+from .const import CONF_YAML_CONFIG_FILE
+from .const import CONFDATA_NODE_FLOORS
+from .const import DEFAULT_KALMAN_MAX_VELOCITY
+from .const import DEFAULT_KALMAN_MEASUREMENT_NOISE
+from .const import DEFAULT_KALMAN_PROCESS_NOISE
+from .const import NOTIFICATION_ID_CALIBRATION_SUCCESS
 from .const import PRUNE_MAX_COUNT
 from .const import PRUNE_TIME_DEFAULT
 from .const import PRUNE_TIME_INTERVAL
@@ -92,6 +118,8 @@ from .const import SIGNAL_DEVICE_NEW
 from .const import SIGNAL_SCANNERS_CHANGED
 from .const import TRILATERATION_POSITION_TIMEOUT
 from .const import UPDATE_INTERVAL
+from .kalman import KalmanFilterSettings
+from .kalman import KalmanLocation
 from .trilateration import calculate_position
 from .trilateration import find_room_for_position
 from .util import mac_explode_formats
@@ -113,6 +141,12 @@ Cancellable = Callable[[], None]
 # so we're just disabling it for the whole file.
 # https://github.com/astral-sh/ruff/issues/4244
 # ruff: noqa: PLR1730
+
+
+def _slugify_name(name: str) -> str:
+    """Convert a name to a slug ID (lowercase, spaces to hyphens)."""
+    import re as _re
+    return _re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
 class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
@@ -235,10 +269,24 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # any there for us to track.
         self._do_private_device_init = True
 
+        # Auto-calibration tracking
+        self._last_calibration_time: float = 0  # Monotonic timestamp of last calibration run
+        self._last_calibration_notification: float = 0  # Cooldown for insufficient data notifications
+        self._calibration_in_progress: bool = False  # Prevent concurrent calibration runs
+
         # Listen for changes to the device registry and handle them.
         # Primarily for changes to scanners and Private BLE Devices.
         self.config_entry.async_on_unload(
             self.hass.bus.async_listen(EVENT_DEVICE_REGISTRY_UPDATED, self.handle_devreg_changes)
+        )
+
+        # Register periodic auto-calibration task (checks every hour)
+        self.config_entry.async_on_unload(
+            async_track_time_interval(
+                self.hass,
+                self._async_periodic_auto_calibration,
+                timedelta(hours=1),
+            )
         )
 
         self.options = {}
@@ -290,6 +338,15 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                     vol.Optional("redact"): cv.boolean,
                 }
             ),
+            SupportsResponse.ONLY,
+        )
+
+        # Register the check_scanner_broadcasting service
+        hass.services.async_register(
+            DOMAIN,
+            "check_scanner_broadcasting",
+            self.service_check_scanner_broadcasting,
+            vol.Schema({}),
             SupportsResponse.ONLY,
         )
 
@@ -408,63 +465,236 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             self._waitingfor_load_manufacturer_ids = False
 
     def load_scanner_positions(self):
-        """Load scanner positions from config entry for trilateration."""
+        """Load scanner positions from bermuda.yaml or config entry for trilateration.
+
+        Loading priority:
+        1. bermuda.yaml in HA config dir (ESPresense-compatible format)
+        2. Config entry data (JSON import from config flow)
+        """
         _LOGGER.info("=== LOADING SCANNER POSITIONS ===")
-        _LOGGER.debug("Current devices in Bermuda: %s", list(self.devices.keys()))
         _LOGGER.debug("Current scanners: %s", [d.address for d in self.get_scanners])
-        _LOGGER.info(
-            "Scanner states: %s",
-            {addr: f"is_scanner={dev.is_scanner}, has_position={dev.position is not None}"
-             for addr, dev in self.devices.items() if dev.is_scanner or dev.position is not None}
-        )
+
+        positions_loaded = 0
+        self.map_floors = {}
+        self.map_rooms = {}
+
+        # Try loading ESPresense-compatible YAML config first
+        yaml_loaded = self._load_yaml_config()
+        if yaml_loaded:
+            positions_loaded = yaml_loaded
+        else:
+            # Fall back to config entry data
+            positions_loaded = self._load_config_entry_positions()
+
+        if positions_loaded > 0:
+            _LOGGER.info("Loaded %d scanner positions for position tracking", positions_loaded)
+        else:
+            _LOGGER.warning("No valid scanner positions loaded")
+            _LOGGER.warning("  Create bermuda.yaml in your HA config dir or use Bulk Import")
+
+        if self.map_rooms:
+            _LOGGER.info("Loaded %d rooms for zone detection", len(self.map_rooms))
+        if self.map_floors:
+            _LOGGER.info("Loaded %d floors", len(self.map_floors))
+
+    def _load_yaml_config(self) -> int:
+        """Load ESPresense-compatible YAML config from bermuda.yaml.
+
+        Returns number of scanner positions loaded, or 0 if file not found.
+        """
+        import os
+
+        yaml_path = self.hass.config.path(CONF_YAML_CONFIG_FILE)
+        if not os.path.isfile(yaml_path):
+            _LOGGER.debug("No bermuda.yaml found at %s", yaml_path)
+            return 0
+
+        _LOGGER.info("Loading ESPresense-compatible config from %s", yaml_path)
+
+        try:
+            with open(yaml_path) as f:
+                config = yaml.safe_load(f)
+        except Exception as e:
+            _LOGGER.error("Failed to parse bermuda.yaml: %s", e)
+            return 0
+
+        if not isinstance(config, dict):
+            _LOGGER.error("bermuda.yaml: invalid format (expected dict)")
+            return 0
 
         positions_loaded = 0
 
-        # First, load from config entry if available
+        # Load Kalman filter settings from YAML
+        filtering = config.get("filtering", {})
+        if filtering:
+            from .const import CONF_KALMAN_PROCESS_NOISE
+            from .const import CONF_KALMAN_MEASUREMENT_NOISE
+            from .const import CONF_KALMAN_MAX_VELOCITY
+            # Store as instance attributes for use by position pipeline
+            self._yaml_kalman_process_noise = filtering.get("process_noise", 0.01)
+            self._yaml_kalman_measurement_noise = filtering.get("measurement_noise", 0.1)
+            self._yaml_kalman_max_velocity = filtering.get("max_velocity", 0.5)
+            _LOGGER.info(
+                "Kalman filter settings: process_noise=%.3f, measurement_noise=%.3f, max_velocity=%.2f",
+                self._yaml_kalman_process_noise,
+                self._yaml_kalman_measurement_noise,
+                self._yaml_kalman_max_velocity,
+            )
+
+        # Load floors with nested rooms (ESPresense format)
+        yaml_floors = config.get("floors", [])
+        for floor_data in yaml_floors:
+            floor_id = floor_data.get("id") or _slugify_name(floor_data.get("name", ""))
+            if not floor_id:
+                continue
+
+            floor_entry = {
+                "id": floor_id,
+                "name": floor_data.get("name", floor_id),
+                "bounds": floor_data.get("bounds", []),
+                "rooms": [],
+            }
+
+            # ESPresense nests rooms inside floors
+            for room_data in floor_data.get("rooms", []):
+                room_name = room_data.get("name", "")
+                room_id = room_data.get("id") or _slugify_name(room_name)
+                if not room_id:
+                    continue
+
+                room_entry = {
+                    "id": room_id,
+                    "name": room_name,
+                    "floor": floor_id,
+                    "points": room_data.get("points", []),
+                }
+                floor_entry["rooms"].append(room_entry)
+                self.map_rooms[room_id] = room_entry
+
+            self.map_floors[floor_id] = floor_entry
+
+        # Load nodes (scanner positions)
+        yaml_nodes = config.get("nodes", [])
+        for node in yaml_nodes:
+            node_name = node.get("name", "")
+            node_id = node.get("id") or node_name
+            point = node.get("point")
+            node_floors = node.get("floors", [])
+
+            if not point or len(point) < 3:
+                _LOGGER.warning("bermuda.yaml: Node '%s' missing point [x,y,z]", node_id)
+                continue
+
+            # Match node to a bermuda scanner by name or address
+            matched_scanner = self._match_yaml_node_to_scanner(node_id, node_name)
+            if matched_scanner:
+                matched_scanner.position = tuple(point)
+                matched_scanner.node_floors = node_floors if node_floors else None
+                positions_loaded += 1
+                _LOGGER.info(
+                    "  Loaded position for scanner %s (%s): (%.2f, %.2f, %.2f) floors=%s",
+                    node_name,
+                    matched_scanner.address,
+                    point[0], point[1], point[2],
+                    node_floors,
+                )
+            else:
+                _LOGGER.warning(
+                    "  bermuda.yaml: Node '%s' not matched to any known scanner",
+                    node_id,
+                )
+
+        # Load timeout settings
+        timeout = config.get("timeout")
+        if timeout is not None:
+            _LOGGER.debug("bermuda.yaml: timeout=%d", timeout)
+
+        return positions_loaded
+
+    def _match_yaml_node_to_scanner(self, node_id: str, node_name: str) -> BermudaDevice | None:
+        """Match a YAML node definition to a bermuda scanner device.
+
+        Tries matching by:
+        1. Node ID as MAC address
+        2. Node name matching scanner name (case-insensitive)
+        3. Node name contained in scanner name
+        """
+        # Try node_id as MAC address
+        try:
+            normalized = mac_norm(node_id)
+            if normalized in self.devices and self.devices[normalized].is_scanner:
+                return self.devices[normalized]
+        except (ValueError, TypeError):
+            pass
+
+        # Try matching by name
+        name_lower = node_name.lower() if node_name else ""
+        id_lower = node_id.lower() if node_id else ""
+
+        for scanner in self._scanners:
+            scanner_name = (scanner.name or "").lower()
+            scanner_name_bt = (scanner.name_bt_local_name or "").lower()
+            scanner_name_user = (scanner.name_by_user or "").lower()
+
+            # Exact name match
+            if name_lower and (
+                scanner_name == name_lower
+                or scanner_name_bt == name_lower
+                or scanner_name_user == name_lower
+            ):
+                return scanner
+
+            # ID match
+            if id_lower and (
+                scanner_name == id_lower
+                or scanner_name_bt == id_lower
+                or scanner_name_user == id_lower
+            ):
+                return scanner
+
+            # Partial name match (node name contained in scanner name)
+            if name_lower and len(name_lower) >= 3 and (
+                name_lower in scanner_name
+                or name_lower in scanner_name_bt
+                or name_lower in scanner_name_user
+            ):
+                return scanner
+
+        return None
+
+    def _load_config_entry_positions(self) -> int:
+        """Load scanner positions from config entry data (JSON import format)."""
+        positions_loaded = 0
+
         config_floors = self.options.get(CONFDATA_FLOORS, [])
         config_rooms = self.options.get(CONFDATA_ROOMS, [])
         config_positions = self.options.get(CONFDATA_SCANNER_POSITIONS, {})
 
-        # Load floors from config entry
+        # Load floors
         for floor in config_floors:
             self.map_floors[floor["id"]] = floor
-            _LOGGER.info("Loaded floor from config: %s (%s)", floor["id"], floor.get("name"))
 
-        # Load rooms from config entry
+        # Load rooms
         for room in config_rooms:
             self.map_rooms[room["id"]] = room
-            _LOGGER.info(
-                "Loaded room from config: %s (%s) with %d vertices",
-                room["id"],
-                room.get("name"),
-                len(room.get("points", [])),
-            )
 
-        # Apply scanner positions from config entry
+        # Apply scanner positions
         for m, pos_data in config_positions.items():
-            mac = mac_norm(m)  # Normalize MAC address
+            mac = mac_norm(m)
             if mac in self.devices and self.devices[mac].is_scanner:
                 self.devices[mac].position = tuple(pos_data["point"])
+                # Load floor assignments if present
+                if "floors" in pos_data:
+                    self.devices[mac].node_floors = pos_data["floors"]
                 positions_loaded += 1
                 _LOGGER.info(
-                    "  ✓ Loaded position from config for scanner %s (%s): (%.2f, %.2f, %.2f)",
+                    "  Loaded position for scanner %s (%s): (%.2f, %.2f, %.2f)",
                     pos_data.get("name", mac),
                     mac,
-                    pos_data["point"][0],
-                    pos_data["point"][1],
-                    pos_data["point"][2],
+                    pos_data["point"][0], pos_data["point"][1], pos_data["point"][2],
                 )
 
-        if positions_loaded > 0:
-            _LOGGER.info("✓ Loaded %d scanner positions for trilateration", positions_loaded)
-        else:
-            _LOGGER.warning("✗ No valid scanner positions loaded")
-            _LOGGER.warning("  Use the 'Bulk Import Map & Scanners' option to configure positions")
-
-        if len(self.map_rooms) > 0:
-            _LOGGER.info("✓ Loaded %d rooms for zone detection", len(self.map_rooms))
-        if len(self.map_floors) > 0:
-            _LOGGER.info("✓ Loaded %d floors", len(self.map_floors))
+        return positions_loaded
 
     @callback
     def handle_devreg_changes(self, ev: Event[EventDeviceRegistryUpdatedData]):
@@ -665,6 +895,450 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             for scannerdev in self.get_scanners
         ]
 
+    def collect_calibration_rssi_data(
+        self,
+        target_device_address: str,
+        min_samples: int = 10,
+    ) -> dict[str, list[float]]:
+        """
+        Collect RSSI sample data from all scanners for a specific calibration target device.
+
+        Returns a dict mapping scanner_address -> list of RSSI samples.
+        Only includes scanners with at least min_samples recent RSSI readings.
+
+        Args:
+            target_device_address: MAC address of the calibration beacon device
+            min_samples: Minimum number of samples required per scanner (default 10)
+
+        Returns:
+            Dict mapping scanner_address -> list of RSSI values (floats)
+        """
+        target_device = self._get_device(target_device_address)
+        if target_device is None:
+            _LOGGER.warning(
+                "Calibration target device %s not found in devices",
+                target_device_address,
+            )
+            return {}
+
+        scanner_rssi_data: dict[str, list[float]] = {}
+
+        # Iterate through all adverts for this device
+        for advert_key, advert in target_device.adverts.items():
+            scanner_addr = advert.scanner_address
+
+            # Only use scanners (not device-to-device adverts)
+            if scanner_addr not in self.devices:
+                continue
+
+            scanner_device = self.devices[scanner_addr]
+            if not scanner_device.is_scanner:
+                continue
+
+            # Collect RSSI history from the advert object
+            # hist_rssi is a deque with most recent values
+            rssi_samples = list(advert.hist_rssi)
+
+            # Filter out None values and ensure we have enough samples
+            rssi_samples = [float(r) for r in rssi_samples if r is not None]
+
+            if len(rssi_samples) >= min_samples:
+                scanner_rssi_data[scanner_addr] = rssi_samples
+
+        return scanner_rssi_data
+
+    def get_scanner_positions_dict(self) -> dict[str, tuple[float, float, float]]:
+        """
+        Get scanner positions as a dict mapping scanner_address -> (x, y, z).
+
+        Returns:
+            Dict of scanner positions, empty dict if no positions configured
+        """
+        scanner_positions: dict[str, tuple[float, float, float]] = {}
+
+        for scanner_addr, scanner_device in self.devices.items():
+            if scanner_device.is_scanner and scanner_device.position is not None:
+                scanner_positions[scanner_addr] = scanner_device.position
+
+        return scanner_positions
+
+    def collect_scanner_to_scanner_rssi_data(
+        self,
+        min_samples: int = 10,
+    ) -> dict[tuple[str, str], list[float]]:
+        """
+        Collect RSSI measurements between all scanner pairs for auto-calibration.
+
+        Returns dict mapping (scanner_A_address, scanner_B_address) -> list of RSSI samples.
+        Only includes pairs where scanner A has received broadcasts from scanner B.
+
+        This enables scanner-to-scanner RF ranging calibration without needing an external beacon.
+        Requires that scanners are configured to broadcast BLE advertisements.
+
+        Args:
+            min_samples: Minimum number of samples required per scanner pair (default 10)
+
+        Returns:
+            Dict mapping (scanner_A_addr, scanner_B_addr) -> list of RSSI values (floats)
+            Empty dict if insufficient data
+        """
+        scanner_pairs_rssi: dict[tuple[str, str], list[float]] = {}
+
+        # Get all scanner devices
+        scanner_devices = {addr: dev for addr, dev in self.devices.items() if dev.is_scanner}
+
+        if len(scanner_devices) < 2:
+            _LOGGER.debug("Scanner-to-scanner calibration: Need at least 2 scanners, found %d", len(scanner_devices))
+            return {}
+        
+        _LOGGER.debug(
+            "Scanner-to-scanner calibration: Found %d scanners: %s",
+            len(scanner_devices),
+            ", ".join(scanner_devices.keys()),
+        )
+
+        # For each device in the system, check if it's a scanner broadcasting to other scanners
+        for device_addr, device in self.devices.items():
+            # Check if this device is a scanner (i.e., it broadcasts BLE advertisements)
+            # that other scanners have received
+            
+            # Look at all the adverts for this device
+            # Each advert represents: "device_addr was seen by scanner_addr"
+            # The advert_key tuple is (device_address, scanner_address)
+            for advert_key, advert in device.adverts.items():
+                # advert_key is always (device_address, scanner_address)
+                # device_address should match this device, scanner_address is who received it
+                if isinstance(advert_key, tuple) and len(advert_key) == 2:
+                    transmitting_device, receiving_scanner = advert_key
+                    
+                    # Verify this is an advert for the current device
+                    if transmitting_device != device_addr:
+                        continue
+                    
+                    # Check if BOTH the transmitting device AND receiving scanner are scanners
+                    # This means we have scanner-to-scanner communication
+                    if transmitting_device in scanner_devices and receiving_scanner in scanner_devices:
+                        # Found scanner-to-scanner pair!
+                        # receiving_scanner saw transmitting_device
+                        
+                        rssi_samples = list(advert.hist_rssi)
+                        rssi_samples = [float(r) for r in rssi_samples if r is not None]
+                        
+                        if len(rssi_samples) >= min_samples:
+                            # Store as (receiver, transmitter) tuple
+                            pair_key = (receiving_scanner, transmitting_device)
+                            scanner_pairs_rssi[pair_key] = rssi_samples
+                            _LOGGER.debug(
+                                "Scanner-to-scanner: Found %d RSSI samples from %s received by %s",
+                                len(rssi_samples),
+                                transmitting_device,
+                                receiving_scanner,
+                            )
+                        elif len(rssi_samples) > 0:
+                            # Has some samples but not enough
+                            _LOGGER.debug(
+                                "Scanner-to-scanner: Insufficient samples from %s received by %s (%d < %d needed)",
+                                transmitting_device,
+                                receiving_scanner,
+                                len(rssi_samples),
+                                min_samples,
+                            )
+
+        if scanner_pairs_rssi:
+            _LOGGER.info(
+                "Scanner-to-scanner calibration: Found %d scanner pairs with sufficient data (min %d samples)",
+                len(scanner_pairs_rssi),
+                min_samples,
+            )
+            # Log summary of which scanners are broadcasting
+            broadcasting_scanners = set()
+            for receiver, transmitter in scanner_pairs_rssi.keys():
+                broadcasting_scanners.add(transmitter)
+            _LOGGER.info(
+                "Scanner-to-scanner: Detected %d broadcasting scanners: %s",
+                len(broadcasting_scanners),
+                ", ".join(sorted(broadcasting_scanners)),
+            )
+        else:
+            _LOGGER.warning(
+                "Scanner-to-scanner calibration: No scanner pairs found with sufficient RSSI data (need %d samples). "
+                "Ensure scanners are configured to broadcast BLE advertisements.",
+                min_samples,
+            )
+
+        return scanner_pairs_rssi
+
+    async def _async_periodic_auto_calibration(self, now=None):
+        """
+        Periodic task to run automatic scanner-to-scanner calibration.
+
+        Runs every hour, checks if calibration is enabled and interval has elapsed.
+        Uses scanner-to-scanner RF ranging method only (beacon method not supported for background).
+        """
+        # Check if auto-calibration is enabled
+        if not self.options.get(CONF_AUTO_CALIBRATION_ENABLED, DEFAULT_AUTO_CALIBRATION_ENABLED):
+            return
+
+        # Check if already running
+        if self._calibration_in_progress:
+            _LOGGER.debug("Auto-calibration already in progress, skipping this cycle")
+            return
+
+        # Check if enough time has elapsed since last calibration
+        interval_hours = self.options.get(
+            CONF_AUTO_CALIBRATION_INTERVAL_HOURS,
+            DEFAULT_AUTO_CALIBRATION_INTERVAL_HOURS,
+        )
+        current_time = monotonic_time_coarse()
+        elapsed_hours = (current_time - self._last_calibration_time) / 3600
+
+        if elapsed_hours < interval_hours:
+            _LOGGER.debug(
+                "Auto-calibration: %.1f hours since last run, need %.1f hours",
+                elapsed_hours,
+                interval_hours,
+            )
+            return
+
+        _LOGGER.info("Starting automatic RSSI calibration (scanner-to-scanner method)")
+        self._calibration_in_progress = True
+
+        try:
+            await self._run_scanner_to_scanner_calibration()
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.exception("Auto-calibration failed with exception: %s", e)
+            await async_create_notification(
+                self.hass,
+                f"Automatic RSSI calibration failed: {e}",
+                title="Bermuda Auto-Calibration Error",
+                notification_id=NOTIFICATION_ID_CALIBRATION_INSUFFICIENT,
+            )
+        finally:
+            self._calibration_in_progress = False
+            self._last_calibration_time = current_time
+
+    async def _run_scanner_to_scanner_calibration(self):
+        """
+        Run scanner-to-scanner RF ranging calibration and apply results.
+
+        Collects RSSI data between scanner pairs, calculates offsets,
+        and updates config entry with new offsets.
+
+        Creates persistent notifications for success/failure.
+        """
+        from .util import calculate_scanner_offsets_from_scanner_pairs
+        from .util import get_scanner_pair_quality_metrics
+
+        # Get configuration
+        min_samples = self.options.get(CONF_AUTO_CALIBRATION_SAMPLES, 50)
+        ref_power = self.options.get(CONF_REF_POWER, -55.0)
+        attenuation = self.options.get(CONF_ATTENUATION, 3.5)
+
+        # Collect scanner-to-scanner RSSI data
+        scanner_pairs_rssi = self.collect_scanner_to_scanner_rssi_data(min_samples=min_samples)
+
+        # Check for insufficient data
+        if len(scanner_pairs_rssi) < AUTO_CALIBRATION_MIN_SCANNER_PAIRS:
+            # Check notification cooldown
+            current_time = monotonic_time_coarse()
+            if current_time - self._last_calibration_notification > CALIBRATION_NOTIFICATION_COOLDOWN:
+                # Detect non-broadcasting scanners
+                non_broadcasting = await self._detect_non_broadcasting_scanners()
+
+                if non_broadcasting:
+                    # Create notification about non-broadcasting scanners
+                    scanner_names = ", ".join([dev.name for dev in non_broadcasting[:5]])
+                    if len(non_broadcasting) > 5:
+                        scanner_names += f" (+{len(non_broadcasting) - 5} more)"
+
+                    message = (
+                        f"**Automatic RSSI calibration requires broadcasting scanners**\n\n"
+                        f"Found {len(scanner_pairs_rssi)} scanner pairs with data, "
+                        f"need {AUTO_CALIBRATION_MIN_SCANNER_PAIRS}.\n\n"
+                        f"**Scanners not broadcasting:** {scanner_names}\n\n"
+                        f"Configure ESPHome proxies to broadcast BLE advertisements:\n"
+                        f"```yaml\n"
+                        f"esp32_ble_tracker:\n"
+                        f"  scan_parameters:\n"
+                        f"    active: true\n"
+                        f"  # Enable BLE broadcasting\n"
+                        f"  on_ble_advertise:\n"
+                        f"    - then:\n"
+                        f"        - ble_advertise.start:\n"
+                        f"            transmit_power: 3dBm\n"
+                        f"```\n\n"
+                        f"Alternatively, disable auto-calibration or use manual beacon calibration."
+                    )
+                    await async_create_notification(
+                        self.hass,
+                        message,
+                        title="Bermuda Auto-Calibration: No Broadcasting Scanners",
+                        notification_id=NOTIFICATION_ID_CALIBRATION_NO_BROADCASTING,
+                    )
+                else:
+                    # Generic insufficient data message
+                    message = (
+                        f"**Automatic RSSI calibration: Insufficient data**\n\n"
+                        f"Found {len(scanner_pairs_rssi)} scanner pairs with data, "
+                        f"need {AUTO_CALIBRATION_MIN_SCANNER_PAIRS}.\n\n"
+                        f"Calibration will retry in {self.options.get(CONF_AUTO_CALIBRATION_INTERVAL_HOURS, 24)} hours. "
+                        f"Ensure scanners are configured to broadcast BLE advertisements and have been running "
+                        f"for sufficient time to collect {min_samples} samples."
+                    )
+                    await async_create_notification(
+                        self.hass,
+                        message,
+                        title="Bermuda Auto-Calibration: Insufficient Data",
+                        notification_id=NOTIFICATION_ID_CALIBRATION_INSUFFICIENT,
+                    )
+
+                self._last_calibration_notification = current_time
+
+            _LOGGER.warning(
+                "Auto-calibration: Insufficient scanner pairs (%d < %d)",
+                len(scanner_pairs_rssi),
+                AUTO_CALIBRATION_MIN_SCANNER_PAIRS,
+            )
+            return
+
+        # Get scanner positions
+        scanner_positions = self.get_scanner_positions_dict()
+
+        # Calculate offsets
+        new_offsets = calculate_scanner_offsets_from_scanner_pairs(
+            scanner_pairs_rssi,
+            scanner_positions,
+            ref_power,
+            attenuation,
+        )
+
+        if not new_offsets:
+            _LOGGER.error("Auto-calibration: Failed to calculate offsets")
+            return
+
+        # Calculate quality metrics for reporting
+        metrics = get_scanner_pair_quality_metrics(scanner_pairs_rssi, scanner_positions)
+
+        # Build success notification with metrics
+        status_lines = [
+            "**Automatic RSSI Calibration Successful**\n",
+            f"Calibrated {len(new_offsets)} scanners using {len(scanner_pairs_rssi)} scanner pairs.\n",
+            "\n**Calculated Offsets:**\n",
+        ]
+
+        for scanner_addr, offset in sorted(new_offsets.items(), key=lambda x: x[1], reverse=True):
+            scanner_name = self.devices[scanner_addr].name if scanner_addr in self.devices else scanner_addr
+            status_lines.append(f"- {scanner_name}: {offset:+.1f} dBm")
+
+        status_lines.append("\n**Scanner Pair Quality:**\n")
+        status_lines.append("|Receiver → Transmitter|Distance|Samples|RSSI Median|RSSI StdDev|")
+        status_lines.append("|---|---:|---:|---:|---:|")
+
+        for (receiver_addr, transmitter_addr), metric in list(metrics.items())[:10]:  # Limit to 10 pairs
+            receiver_name = self.devices[receiver_addr].name
+            transmitter_name = self.devices[transmitter_addr].name
+            status_lines.append(
+                f"|{receiver_name} → {transmitter_name}"
+                f"|{metric['distance']:.2f}m"
+                f"|{metric['sample_count']}"
+                f"|{metric['rssi_median']:.1f} dBm"
+                f"|{metric['rssi_std']:.1f} dBm|"
+            )
+
+        if len(metrics) > 10:
+            status_lines.append(f"\n*... and {len(metrics) - 10} more pairs*")
+
+        # Dismiss any previous error notifications
+        await async_dismiss_notification(self.hass, NOTIFICATION_ID_CALIBRATION_INSUFFICIENT)
+        await async_dismiss_notification(self.hass, NOTIFICATION_ID_CALIBRATION_NO_BROADCASTING)
+
+        # Create success notification (auto-dismiss after 1 hour)
+        await async_create_notification(
+            self.hass,
+            "\n".join(status_lines),
+            title="Bermuda Auto-Calibration Complete",
+            notification_id=NOTIFICATION_ID_CALIBRATION_SUCCESS,
+        )
+
+        # Update config entry with new offsets
+        self.options[CONF_RSSI_OFFSETS] = new_offsets
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            options=self.options,
+        )
+
+        _LOGGER.info(
+            "Auto-calibration complete: %d scanners calibrated from %d pairs",
+            len(new_offsets),
+            len(scanner_pairs_rssi),
+        )
+
+    async def _detect_non_broadcasting_scanners(self) -> list[BermudaDevice]:
+        """
+        Detect scanners that are not broadcasting BLE advertisements.
+
+        A scanner is considered non-broadcasting if:
+        - It is marked as a scanner (is_scanner=True)
+        - No other scanners have received advertisements from it
+
+        Returns:
+            List of BermudaDevice objects for non-broadcasting scanners
+        """
+        scanner_devices = {addr: dev for addr, dev in self.devices.items() if dev.is_scanner}
+
+        if len(scanner_devices) < 2:
+            _LOGGER.debug("Cannot detect broadcasting with < 2 scanners")
+            return list(scanner_devices.values())  # All scanners if only 1
+
+        non_broadcasting = []
+        broadcasting_info = {}  # Track which scanners see which
+
+        for scanner_addr, scanner_device in scanner_devices.items():
+            # Check if any OTHER scanner has received from this scanner
+            is_broadcasting = False
+            receivers = []
+
+            # Iterate through all devices to find this scanner in their adverts
+            for device_addr, device in self.devices.items():
+                # Skip if checking against self
+                if device_addr == scanner_addr:
+                    continue
+                
+                # Check if this device has adverts from our scanner
+                for advert_key in device.adverts.keys():
+                    if isinstance(advert_key, tuple) and len(advert_key) == 2:
+                        transmitting_device, receiving_scanner = advert_key
+                        
+                        # Found: scanner_addr transmitted to this device
+                        if transmitting_device == scanner_addr and receiving_scanner in scanner_devices:
+                            is_broadcasting = True
+                            receivers.append(receiving_scanner)
+
+            if is_broadcasting:
+                broadcasting_info[scanner_addr] = receivers
+                _LOGGER.debug(
+                    "Scanner %s IS broadcasting (seen by %d scanners: %s)",
+                    scanner_addr,
+                    len(receivers),
+                    ", ".join(receivers[:3]) + ("..." if len(receivers) > 3 else ""),
+                )
+            else:
+                non_broadcasting.append(scanner_device)
+                _LOGGER.debug(
+                    "Scanner %s is NOT broadcasting (not seen by any other scanner)",
+                    scanner_addr,
+                )
+
+        # Log summary
+        _LOGGER.info(
+            "Broadcasting detection: %d/%d scanners broadcasting, %d not broadcasting",
+            len(broadcasting_info),
+            len(scanner_devices),
+            len(non_broadcasting),
+        )
+
+        return non_broadcasting
+
     def _get_device(self, address: str) -> BermudaDevice | None:
         """Search for a device entry based on mac address."""
         # mac_norm tries to return a lower-cased, colon-separated mac address.
@@ -769,19 +1443,45 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         )
                         result = calculate_position(device, nowstamp, debug_enabled)
                         if result:
+                            # Apply Kalman filter to smooth position
+                            if device._kalman_location is None:
+                                settings = KalmanFilterSettings(
+                                    process_noise=self.options.get(
+                                        CONF_KALMAN_PROCESS_NOISE, DEFAULT_KALMAN_PROCESS_NOISE
+                                    ),
+                                    measurement_noise=self.options.get(
+                                        CONF_KALMAN_MEASUREMENT_NOISE, DEFAULT_KALMAN_MEASUREMENT_NOISE
+                                    ),
+                                    max_velocity=self.options.get(
+                                        CONF_KALMAN_MAX_VELOCITY, DEFAULT_KALMAN_MAX_VELOCITY
+                                    ),
+                                )
+                                device._kalman_location = KalmanLocation(settings)
+
+                            filtered_x, filtered_y, filtered_z = device._kalman_location.update(
+                                result.x, result.y, result.z, nowstamp
+                            )
+
                             _LOGGER.info(
-                                "Position calculated for %s: (%.2f, %.2f, %.2f) confidence=%.1f%% method=%s",
+                                "Position for %s: raw=(%.2f,%.2f,%.2f) filtered=(%.2f,%.2f,%.2f) "
+                                "confidence=%.1f%% method=%s error=%.3f corr=%.3f",
                                 device.name,
-                                result.x,
-                                result.y,
-                                result.z,
+                                result.x, result.y, result.z,
+                                filtered_x, filtered_y, filtered_z,
                                 result.confidence,
                                 result.method,
+                                result.error,
+                                result.correlation,
                             )
-                            device.calculated_position = (result.x, result.y, result.z)
+
+                            device.calculated_position = (filtered_x, filtered_y, filtered_z)
                             device.position_confidence = result.confidence
                             device.position_timestamp = nowstamp
                             device.position_method = result.method
+                            device.position_error = result.error
+                            device.position_correlation = result.correlation
+                            device.position_room_id = result.room_id
+                            device.position_floor_id = result.floor_id
 
                             # Determine room from position and override area assignment if enabled
                             if (
@@ -790,18 +1490,14 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                                 and result.confidence
                                 >= self.options.get(CONF_TRILATERATION_AREA_MIN_CONFIDENCE, 30.0)
                             ):
-                                _LOGGER.debug(
-                                    "Checking room for position (%.2f, %.2f, %.2f)",
-                                    result.x,
-                                    result.y,
-                                    result.z,
-                                )
-
-                                room_area_id = find_room_for_position(
-                                    (result.x, result.y, result.z),
-                                    list(self.map_rooms.values()),
-                                    list(self.map_floors.values()) if self.map_floors else None,
-                                )
+                                # Use room_id from trilateration if available, else look up from position
+                                room_area_id = result.room_id
+                                if not room_area_id:
+                                    room_area_id = find_room_for_position(
+                                        (filtered_x, filtered_y, filtered_z),
+                                        list(self.map_rooms.values()),
+                                        list(self.map_floors.values()) if self.map_floors else None,
+                                    )
 
                                 if room_area_id:
                                     # Map to HA Area
@@ -1860,6 +2556,107 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             else:
                 _LOGGER.debug("Dump devices redaction took %2f seconds", _stamp_redact_elapsed)
         return out
+
+    async def service_check_scanner_broadcasting(self, call: ServiceCall) -> ServiceResponse:  # pylint: disable=unused-argument;
+        """
+        Check which scanners are broadcasting BLE advertisements.
+
+        Returns detailed information about scanner broadcasting status for
+        scanner-to-scanner calibration diagnostics.
+        """
+        scanner_devices = {addr: dev for addr, dev in self.devices.items() if dev.is_scanner}
+        
+        result = {
+            "total_scanners": len(scanner_devices),
+            "broadcasting": [],
+            "not_broadcasting": [],
+            "scanner_pairs": [],
+            "summary": "",
+        }
+
+        if len(scanner_devices) < 2:
+            result["summary"] = f"Only {len(scanner_devices)} scanner(s) found. Need at least 2 for scanner-to-scanner calibration."
+            return result
+
+        broadcasting_info = {}
+        non_broadcasting = []
+
+        # Check each scanner for broadcasting
+        for scanner_addr, scanner_device in scanner_devices.items():
+            receivers = []
+            
+            # Check if any other device has received from this scanner
+            for device_addr, device in self.devices.items():
+                if device_addr == scanner_addr:
+                    continue
+                
+                for advert_key in device.adverts.keys():
+                    if isinstance(advert_key, tuple) and len(advert_key) == 2:
+                        transmitting_device, receiving_scanner = advert_key
+                        
+                        if transmitting_device == scanner_addr and receiving_scanner in scanner_devices:
+                            receivers.append(receiving_scanner)
+            
+            if receivers:
+                broadcasting_info[scanner_addr] = receivers
+                result["broadcasting"].append({
+                    "address": scanner_addr,
+                    "name": scanner_device.name,
+                    "seen_by": len(receivers),
+                    "receivers": receivers,
+                })
+            else:
+                non_broadcasting.append(scanner_device)
+                result["not_broadcasting"].append({
+                    "address": scanner_addr,
+                    "name": scanner_device.name,
+                    "type": "ESPHome" if "espresence" in scanner_device.name.lower() or "esp" in scanner_device.name.lower() else "Unknown",
+                })
+
+        # Collect scanner pair information
+        min_samples = self.options.get(CONF_AUTO_CALIBRATION_SAMPLES, 50)
+        scanner_pairs_rssi = self.collect_scanner_to_scanner_rssi_data(min_samples=min_samples)
+        
+        for (receiver, transmitter), rssi_samples in scanner_pairs_rssi.items():
+            result["scanner_pairs"].append({
+                "receiver": receiver,
+                "transmitter": transmitter,
+                "samples": len(rssi_samples),
+                "avg_rssi": sum(rssi_samples) / len(rssi_samples) if rssi_samples else 0,
+            })
+
+        # Generate summary
+        broadcasting_count = len(broadcasting_info)
+        non_broadcasting_count = len(non_broadcasting)
+        pairs_count = len(scanner_pairs_rssi)
+        min_pairs = AUTO_CALIBRATION_MIN_SCANNER_PAIRS
+
+        if pairs_count >= min_pairs:
+            result["summary"] = (
+                f"✓ Ready for scanner-to-scanner calibration! "
+                f"{broadcasting_count}/{len(scanner_devices)} scanners broadcasting, "
+                f"{pairs_count} scanner pairs found (need {min_pairs})."
+            )
+        elif broadcasting_count == 0:
+            result["summary"] = (
+                f"⚠ No scanners are broadcasting. All {len(scanner_devices)} scanners need ESPHome configuration to broadcast BLE advertisements. "
+                f"See 'not_broadcasting' list for details."
+            )
+        elif non_broadcasting_count > 0:
+            result["summary"] = (
+                f"⚠ Only {broadcasting_count}/{len(scanner_devices)} scanners broadcasting, "
+                f"found {pairs_count} pairs (need {min_pairs}). "
+                f"{non_broadcasting_count} scanner(s) need ESPHome configuration: " +
+                ", ".join([dev.name for dev in non_broadcasting[:3]]) +
+                (f" (+{non_broadcasting_count - 3} more)" if non_broadcasting_count > 3 else "")
+            )
+        else:
+            result["summary"] = (
+                f"⚠ {broadcasting_count} scanners broadcasting but only {pairs_count} pairs found (need {min_pairs}). "
+                f"Wait for more RSSI samples to accumulate (need {min_samples} per pair)."
+            )
+
+        return result
 
     def redaction_list_update(self):
         """

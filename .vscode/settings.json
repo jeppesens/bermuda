@@ -20,6 +20,7 @@
       "approve": true,
       "matchCommandLine": true
     },
-    "./scripts/test": true
+    "./scripts/test": true,
+    "./scripts/lint": true
   }
 }

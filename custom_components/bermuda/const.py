@@ -266,6 +266,90 @@ DOCS[CONF_TRILATERATION_AREA_MIN_CONFIDENCE] = (
 TRILATERATION_POSITION_TIMEOUT = 30
 # seconds before marking a calculated position as stale
 
+# Kalman filter settings (ESPresense-compatible defaults)
+CONF_KALMAN_PROCESS_NOISE, DEFAULT_KALMAN_PROCESS_NOISE = "kalman_process_noise", 0.01
+DOCS[CONF_KALMAN_PROCESS_NOISE] = "Kalman filter process noise. Higher = faster response, more jitter. ESPresense default: 0.01"
+
+CONF_KALMAN_MEASUREMENT_NOISE, DEFAULT_KALMAN_MEASUREMENT_NOISE = "kalman_measurement_noise", 0.1
+DOCS[CONF_KALMAN_MEASUREMENT_NOISE] = "Kalman filter measurement noise. Higher = smoother but slower. ESPresense default: 0.1"
+
+CONF_KALMAN_MAX_VELOCITY, DEFAULT_KALMAN_MAX_VELOCITY = "kalman_max_velocity", 0.5
+DOCS[CONF_KALMAN_MAX_VELOCITY] = "Maximum velocity in m/s for Kalman filter. Movements exceeding this are damped. ESPresense default: 0.5"
+
+# ESPresense-compatible YAML config file
+CONF_YAML_CONFIG_FILE = "bermuda.yaml"
+DOCS[CONF_YAML_CONFIG_FILE] = "ESPresense-compatible YAML configuration file in HA config directory"
+
+# Node floor assignments (stored in config entry data)
+CONFDATA_NODE_FLOORS = "node_floors"
+DOCS[CONFDATA_NODE_FLOORS] = "Per-scanner floor assignments from YAML config"
+
+# Auto-calibration configuration
+CONF_AUTO_CALIBRATION_DEVICE = "auto_calibration_device"
+DOCS[CONF_AUTO_CALIBRATION_DEVICE] = "MAC address of the calibration beacon device"
+
+CONF_AUTO_CALIBRATION_POSITION = "auto_calibration_position"
+DOCS[CONF_AUTO_CALIBRATION_POSITION] = "Known position of calibration beacon (x, y, z) in meters"
+
+CONF_AUTO_CALIBRATION_AREA = "auto_calibration_area"
+DOCS[CONF_AUTO_CALIBRATION_AREA] = "Area ID where calibration beacon is placed (alternative to manual position)"
+
+CONF_AUTO_CALIBRATION_SAMPLES, DEFAULT_AUTO_CALIBRATION_SAMPLES = "auto_calibration_samples", 50
+DOCS[CONF_AUTO_CALIBRATION_SAMPLES] = (
+    "Minimum RSSI samples per scanner required for auto-calibration."
+    " More samples = more robust but slower. 50-100 recommended."
+)
+
+CONF_AUTO_CALIBRATION_MODE, DEFAULT_AUTO_CALIBRATION_MODE = "auto_calibration_mode", "offsets_only"
+DOCS[CONF_AUTO_CALIBRATION_MODE] = (
+    "Auto-calibration mode: 'offsets_only' (normalize scanners, keep global ref_power/attenuation)"
+    " or 'full' (fit ref_power, attenuation, and scanner offsets together)."
+)
+
+CONF_AUTO_CALIBRATION_METHOD, DEFAULT_AUTO_CALIBRATION_METHOD = "auto_calibration_method", "beacon"
+DOCS[CONF_AUTO_CALIBRATION_METHOD] = (
+    "Auto-calibration method: 'beacon' (use external beacon at known position)"
+    " or 'scanners' (use scanner-to-scanner RF ranging - requires broadcasting scanners)."
+)
+
+AUTO_CALIBRATION_MIN_SCANNERS = 2
+# Minimum number of scanners that must see the calibration device
+AUTO_CALIBRATION_MIN_SCANNER_PAIRS = 3
+# Minimum number of scanner-to-scanner pairs needed for scanner-based calibration
+
+# Background auto-calibration configuration
+CONF_AUTO_CALIBRATION_ENABLED, DEFAULT_AUTO_CALIBRATION_ENABLED = "auto_calibration_enabled", False
+DOCS[CONF_AUTO_CALIBRATION_ENABLED] = (
+    "Enable automatic periodic RSSI calibration using scanner-to-scanner RF ranging."
+    " Requires scanners configured to broadcast BLE advertisements."
+)
+
+CONF_AUTO_CALIBRATION_INTERVAL_HOURS, DEFAULT_AUTO_CALIBRATION_INTERVAL_HOURS = (
+    "auto_calibration_interval_hours",
+    24,
+)
+DOCS[CONF_AUTO_CALIBRATION_INTERVAL_HOURS] = (
+    "Hours between automatic calibration runs. Recommended: 12-48 hours."
+)
+
+# Calibration status tracking (stored in config entry data)
+CONFDATA_LAST_CALIBRATION_TIME = "last_calibration_time"
+DOCS[CONFDATA_LAST_CALIBRATION_TIME] = "Timestamp of last successful calibration"
+
+CONFDATA_CALIBRATION_STATUS = "calibration_status"
+DOCS[CONFDATA_CALIBRATION_STATUS] = "Status of last calibration run (success/failure/insufficient_data)"
+
+CONFDATA_CALIBRATION_QUALITY = "calibration_quality"
+DOCS[CONFDATA_CALIBRATION_QUALITY] = "Quality metrics from last calibration (scanner count, sample counts, etc.)"
+
+# Notification IDs for persistent notifications
+NOTIFICATION_ID_CALIBRATION_SUCCESS = f"{DOMAIN}_calibration_success"
+NOTIFICATION_ID_CALIBRATION_INSUFFICIENT = f"{DOMAIN}_calibration_insufficient_data"
+NOTIFICATION_ID_CALIBRATION_NO_BROADCASTING = f"{DOMAIN}_calibration_no_broadcasting_scanners"
+
+# Minimum time between "insufficient data" notifications (to avoid spam)
+CALIBRATION_NOTIFICATION_COOLDOWN = 6 * 3600  # 6 hours in seconds
+
 # Defaults
 DEFAULT_NAME = DOMAIN
 

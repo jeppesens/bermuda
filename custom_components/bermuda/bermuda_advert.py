@@ -515,7 +515,7 @@ class BermudaAdvert(dict):
         if not self.ref_power:  # No user-supplied per-device value
             # use global default
             ref_power = self.conf_ref_power
-            
+
             # Warn if ref_power seems unrealistic (likely misconfigured)
             if ref_power is not None and (ref_power > -50 or ref_power < -85):
                 _LOGGER_SPAM_LESS.warning(

@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:espresense.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:community.home-assistant.io)",
+      "WebFetch(domain:github.com)",
+      "Bash(gh api:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(ls:*)",
+      "Bash(pyenv versions:*)",
+      "Bash(.venv/bin/python -m pytest:*)",
+      "Bash(.venv/bin/pip install:*)",
+      "Bash(~/.pyenv/versions/3.13.7/bin/python -m pytest:*)",
+      "Bash(~/.pyenv/versions/3.12.8/bin/python -m pytest:*)",
+      "Bash(.venv/bin/python:*)",
+      "WebFetch(domain:esphome.io)",
+      "WebFetch(domain:www.derekseaman.com)"
+    ]
+  }
+}
