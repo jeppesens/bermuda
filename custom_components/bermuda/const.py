@@ -276,6 +276,38 @@ DOCS[CONF_KALMAN_MEASUREMENT_NOISE] = "Kalman filter measurement noise. Higher =
 CONF_KALMAN_MAX_VELOCITY, DEFAULT_KALMAN_MAX_VELOCITY = "kalman_max_velocity", 0.5
 DOCS[CONF_KALMAN_MAX_VELOCITY] = "Maximum velocity in m/s for Kalman filter. Movements exceeding this are damped. ESPresense default: 0.5"
 
+# Nadaraya-Watson kernel regression settings
+CONF_NW_BANDWIDTH, DEFAULT_NW_BANDWIDTH = "nw_bandwidth", 0.5
+DOCS[CONF_NW_BANDWIDTH] = (
+    "Gaussian kernel bandwidth for Nadaraya-Watson position estimation."
+    " Lower values = tighter weighting (only close scanners matter)."
+    " ESPresense default: 0.5. Range: 0.1-2.0."
+)
+
+# Room probability smoothing
+CONF_ROOM_SMOOTHING_WEIGHT, DEFAULT_ROOM_SMOOTHING_WEIGHT = "room_smoothing_weight", 0.7
+DOCS[CONF_ROOM_SMOOTHING_WEIGHT] = (
+    "EMA smoothing weight for room probability tracking (0.0-1.0)."
+    " Higher values retain more prior belief, preventing rapid room switching."
+    " ESPresense default: 0.7 (70% prior + 30% measurement)."
+)
+
+# Motion consistency weighting
+CONF_MOTION_SIGMA, DEFAULT_MOTION_SIGMA = "motion_sigma", 2.0
+DOCS[CONF_MOTION_SIGMA] = (
+    "Gaussian sigma for motion consistency weighting in room assignment (meters)."
+    " Rooms far from predicted position are downweighted."
+    " ESPresense default: 2.0. Lower = stricter."
+)
+
+# Nearest-node fallback
+CONF_NEAREST_NODE_MAX_DISTANCE, DEFAULT_NEAREST_NODE_MAX_DISTANCE = "nearest_node_max_distance", 10.0
+DOCS[CONF_NEAREST_NODE_MAX_DISTANCE] = (
+    "Maximum distance (meters) for nearest-node fallback positioning."
+    " Devices further than this from the nearest scanner won't be positioned."
+    " ESPresense default: 10.0."
+)
+
 # ESPresense-compatible YAML config file
 CONF_YAML_CONFIG_FILE = "bermuda.yaml"
 DOCS[CONF_YAML_CONFIG_FILE] = "ESPresense-compatible YAML configuration file in HA config directory"
@@ -349,6 +381,15 @@ NOTIFICATION_ID_CALIBRATION_NO_BROADCASTING = f"{DOMAIN}_calibration_no_broadcas
 
 # Minimum time between "insufficient data" notifications (to avoid spam)
 CALIBRATION_NOTIFICATION_COOLDOWN = 6 * 3600  # 6 hours in seconds
+
+# Optimization bounds (ESPresense defaults)
+OPTIMIZATION_ABSORPTION_MIN = 2.5
+OPTIMIZATION_ABSORPTION_MAX = 3.5
+OPTIMIZATION_REF_POWER_MIN = -70.0
+OPTIMIZATION_REF_POWER_MAX = -50.0
+OPTIMIZATION_RX_ADJ_MIN = -15.0
+OPTIMIZATION_RX_ADJ_MAX = 20.0
+OPTIMIZATION_BASELINE_SNAPSHOTS = 3
 
 # Defaults
 DEFAULT_NAME = DOMAIN

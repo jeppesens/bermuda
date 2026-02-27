@@ -124,6 +124,9 @@ class BermudaDevice(dict):
         # Per-device Kalman filter for position smoothing (lazily initialized)
         self._kalman_location = None  # KalmanLocation instance
 
+        # Per-device room probability tracker for EMA-smoothed room assignment
+        self._room_probability_tracker = None  # RoomProbabilityTracker instance
+
         # For scanners: which floors this node serves (from ESPresense YAML config)
         self.node_floors: list[str] | None = None
 

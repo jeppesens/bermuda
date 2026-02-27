@@ -100,6 +100,10 @@ from .const import NOTIFICATION_ID_CALIBRATION_NO_BROADCASTING
 from .const import CONF_KALMAN_MAX_VELOCITY
 from .const import CONF_KALMAN_MEASUREMENT_NOISE
 from .const import CONF_KALMAN_PROCESS_NOISE
+from .const import CONF_MOTION_SIGMA
+from .const import CONF_ROOM_SMOOTHING_WEIGHT
+from .const import DEFAULT_MOTION_SIGMA
+from .const import DEFAULT_ROOM_SMOOTHING_WEIGHT
 from .const import CONF_YAML_CONFIG_FILE
 from .const import CONFDATA_NODE_FLOORS
 from .const import DEFAULT_KALMAN_MAX_VELOCITY
@@ -122,6 +126,7 @@ from .kalman import KalmanFilterSettings
 from .kalman import KalmanLocation
 from .trilateration import calculate_position
 from .trilateration import find_room_for_position
+from .trilateration import RoomProbabilityTracker
 from .util import mac_explode_formats
 from .util import mac_norm
 from .util import validate_scanners_for_trilateration
@@ -273,6 +278,7 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         self._last_calibration_time: float = 0  # Monotonic timestamp of last calibration run
         self._last_calibration_notification: float = 0  # Cooldown for insufficient data notifications
         self._calibration_in_progress: bool = False  # Prevent concurrent calibration runs
+        self._optimization_baseline: None = None  # OptimizationBaseline, lazily initialized
 
         # Listen for changes to the device registry and handle them.
         # Primarily for changes to scanners and Private BLE Devices.
@@ -1119,20 +1125,28 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _run_scanner_to_scanner_calibration(self):
         """
-        Run scanner-to-scanner RF ranging calibration and apply results.
+        Run scanner-to-scanner RF ranging calibration with Nelder-Mead optimization.
 
-        Collects RSSI data between scanner pairs, calculates offsets,
-        and updates config entry with new offsets.
+        ESPresense-style pipeline:
+        1. Collect scanner-pair RSSI data
+        2. Establish baseline RMS error (3 snapshots required)
+        3. Run 3 independent optimizers: offsets, absorption, ref_power
+        4. Only apply changes that reduce RMS error vs baseline
 
         Creates persistent notifications for success/failure.
         """
-        from .util import calculate_scanner_offsets_from_scanner_pairs
+        from .optimization import calculate_rms_error
+        from .optimization import optimize_absorption
+        from .optimization import optimize_offsets
+        from .optimization import optimize_ref_power
+        from .optimization import OptimizationBaseline
         from .util import get_scanner_pair_quality_metrics
 
         # Get configuration
         min_samples = self.options.get(CONF_AUTO_CALIBRATION_SAMPLES, 50)
-        ref_power = self.options.get(CONF_REF_POWER, -55.0)
-        attenuation = self.options.get(CONF_ATTENUATION, 3.5)
+        ref_power = self.options.get(CONF_REF_POWER, DEFAULT_REF_POWER)
+        attenuation = self.options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION)
+        current_offsets = self.options.get(CONF_RSSI_OFFSETS, {})
 
         # Collect scanner-to-scanner RSSI data
         scanner_pairs_rssi = self.collect_scanner_to_scanner_rssi_data(min_samples=min_samples)
@@ -1146,7 +1160,6 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                 non_broadcasting = await self._detect_non_broadcasting_scanners()
 
                 if non_broadcasting:
-                    # Create notification about non-broadcasting scanners
                     scanner_names = ", ".join([dev.name for dev in non_broadcasting[:5]])
                     if len(non_broadcasting) > 5:
                         scanner_names += f" (+{len(non_broadcasting) - 5} more)"
@@ -1176,7 +1189,6 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                         notification_id=NOTIFICATION_ID_CALIBRATION_NO_BROADCASTING,
                     )
                 else:
-                    # Generic insufficient data message
                     message = (
                         f"**Automatic RSSI calibration: Insufficient data**\n\n"
                         f"Found {len(scanner_pairs_rssi)} scanner pairs with data, "
@@ -1204,37 +1216,129 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         # Get scanner positions
         scanner_positions = self.get_scanner_positions_dict()
 
-        # Calculate offsets
-        new_offsets = calculate_scanner_offsets_from_scanner_pairs(
-            scanner_pairs_rssi,
-            scanner_positions,
-            ref_power,
-            attenuation,
+        # Calculate current RMS error with existing parameters
+        current_rms = calculate_rms_error(
+            scanner_pairs_rssi, scanner_positions, ref_power, attenuation, current_offsets
+        )
+        _LOGGER.info("Auto-calibration: Current RMS distance error = %.4fm", current_rms)
+
+        # Lazily initialize baseline tracker
+        if self._optimization_baseline is None:
+            self._optimization_baseline = OptimizationBaseline()
+
+        # Establish baseline (requires 3 snapshots before optimizing)
+        if not self._optimization_baseline.is_established:
+            established = self._optimization_baseline.add_snapshot(current_rms)
+            if not established:
+                _LOGGER.info(
+                    "Auto-calibration: Collecting baseline snapshot (%d more needed)",
+                    3 - len(self._optimization_baseline._snapshots),
+                )
+                return
+            _LOGGER.info("Auto-calibration: Baseline established, proceeding to optimization")
+
+        # Run 3 independent optimizers
+        changes_applied = []
+
+        # Optimizer 1: Per-scanner RSSI offsets
+        new_offsets, offset_rms = optimize_offsets(
+            scanner_pairs_rssi, scanner_positions, ref_power, attenuation
+        )
+        if new_offsets and self._optimization_baseline.should_apply(offset_rms):
+            self.options[CONF_RSSI_OFFSETS] = new_offsets
+            changes_applied.append(f"offsets (RMS {current_rms:.4f} → {offset_rms:.4f})")
+            _LOGGER.info(
+                "Auto-calibration: Applied new offsets (RMS %.4f → %.4f)",
+                current_rms, offset_rms,
+            )
+        else:
+            _LOGGER.info(
+                "Auto-calibration: Offsets not applied (RMS %.4f vs baseline %.4f)",
+                offset_rms, self._optimization_baseline.baseline_error or 0,
+            )
+
+        # Optimizer 2: Global absorption/attenuation
+        new_att, att_rms = optimize_absorption(
+            scanner_pairs_rssi, scanner_positions, ref_power, attenuation,
+            self.options.get(CONF_RSSI_OFFSETS, {}),
+        )
+        if self._optimization_baseline.should_apply(att_rms):
+            old_att = self.options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION)
+            self.options[CONF_ATTENUATION] = round(new_att, 2)
+            changes_applied.append(
+                f"attenuation {old_att:.2f} → {new_att:.2f} (RMS {current_rms:.4f} → {att_rms:.4f})"
+            )
+            _LOGGER.info(
+                "Auto-calibration: Attenuation %.2f → %.2f (RMS %.4f → %.4f)",
+                old_att, new_att, current_rms, att_rms,
+            )
+        else:
+            _LOGGER.info(
+                "Auto-calibration: Attenuation not changed (%.2f, RMS %.4f vs baseline %.4f)",
+                new_att, att_rms, self._optimization_baseline.baseline_error or 0,
+            )
+
+        # Optimizer 3: Global ref_power
+        new_rp, rp_rms = optimize_ref_power(
+            scanner_pairs_rssi, scanner_positions, ref_power,
+            self.options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION),
+            self.options.get(CONF_RSSI_OFFSETS, {}),
+        )
+        if self._optimization_baseline.should_apply(rp_rms):
+            old_rp = self.options.get(CONF_REF_POWER, DEFAULT_REF_POWER)
+            self.options[CONF_REF_POWER] = round(new_rp, 1)
+            changes_applied.append(
+                f"ref_power {old_rp:.1f} → {new_rp:.1f} (RMS {current_rms:.4f} → {rp_rms:.4f})"
+            )
+            _LOGGER.info(
+                "Auto-calibration: ref_power %.1f → %.1f (RMS %.4f → %.4f)",
+                old_rp, new_rp, current_rms, rp_rms,
+            )
+        else:
+            _LOGGER.info(
+                "Auto-calibration: ref_power not changed (%.1f, RMS %.4f vs baseline %.4f)",
+                new_rp, rp_rms, self._optimization_baseline.baseline_error or 0,
+            )
+
+        # Recalculate final RMS with all applied changes
+        final_rms = calculate_rms_error(
+            scanner_pairs_rssi, scanner_positions,
+            self.options.get(CONF_REF_POWER, DEFAULT_REF_POWER),
+            self.options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION),
+            self.options.get(CONF_RSSI_OFFSETS, {}),
         )
 
-        if not new_offsets:
-            _LOGGER.error("Auto-calibration: Failed to calculate offsets")
-            return
+        # Update baseline if we improved
+        if final_rms < current_rms:
+            self._optimization_baseline.update_baseline(final_rms)
 
-        # Calculate quality metrics for reporting
+        # Build notification
         metrics = get_scanner_pair_quality_metrics(scanner_pairs_rssi, scanner_positions)
 
-        # Build success notification with metrics
         status_lines = [
-            "**Automatic RSSI Calibration Successful**\n",
-            f"Calibrated {len(new_offsets)} scanners using {len(scanner_pairs_rssi)} scanner pairs.\n",
-            "\n**Calculated Offsets:**\n",
+            "**Automatic RSSI Calibration Complete**\n",
+            f"RMS error: {current_rms:.3f}m → {final_rms:.3f}m\n",
         ]
 
-        for scanner_addr, offset in sorted(new_offsets.items(), key=lambda x: x[1], reverse=True):
-            scanner_name = self.devices[scanner_addr].name if scanner_addr in self.devices else scanner_addr
-            status_lines.append(f"- {scanner_name}: {offset:+.1f} dBm")
+        if changes_applied:
+            status_lines.append("\n**Changes applied:**\n")
+            for change in changes_applied:
+                status_lines.append(f"- {change}")
+        else:
+            status_lines.append("\n*No changes applied (current params are already optimal)*\n")
+
+        offsets = self.options.get(CONF_RSSI_OFFSETS, {})
+        if offsets:
+            status_lines.append("\n**Current Offsets:**\n")
+            for scanner_addr, offset in sorted(offsets.items(), key=lambda x: x[1], reverse=True):
+                scanner_name = self.devices[scanner_addr].name if scanner_addr in self.devices else scanner_addr
+                status_lines.append(f"- {scanner_name}: {offset:+.1f} dBm")
 
         status_lines.append("\n**Scanner Pair Quality:**\n")
         status_lines.append("|Receiver → Transmitter|Distance|Samples|RSSI Median|RSSI StdDev|")
         status_lines.append("|---|---:|---:|---:|---:|")
 
-        for (receiver_addr, transmitter_addr), metric in list(metrics.items())[:10]:  # Limit to 10 pairs
+        for (receiver_addr, transmitter_addr), metric in list(metrics.items())[:10]:
             receiver_name = self.devices[receiver_addr].name
             transmitter_name = self.devices[transmitter_addr].name
             status_lines.append(
@@ -1248,11 +1352,10 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
         if len(metrics) > 10:
             status_lines.append(f"\n*... and {len(metrics) - 10} more pairs*")
 
-        # Dismiss any previous error notifications
+        # Dismiss error notifications
         await async_dismiss_notification(self.hass, NOTIFICATION_ID_CALIBRATION_INSUFFICIENT)
         await async_dismiss_notification(self.hass, NOTIFICATION_ID_CALIBRATION_NO_BROADCASTING)
 
-        # Create success notification (auto-dismiss after 1 hour)
         await async_create_notification(
             self.hass,
             "\n".join(status_lines),
@@ -1260,17 +1363,16 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
             notification_id=NOTIFICATION_ID_CALIBRATION_SUCCESS,
         )
 
-        # Update config entry with new offsets
-        self.options[CONF_RSSI_OFFSETS] = new_offsets
-        self.hass.config_entries.async_update_entry(
-            self.config_entry,
-            options=self.options,
-        )
+        # Persist config changes
+        if changes_applied:
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                options=self.options,
+            )
 
         _LOGGER.info(
-            "Auto-calibration complete: %d scanners calibrated from %d pairs",
-            len(new_offsets),
-            len(scanner_pairs_rssi),
+            "Auto-calibration complete: RMS %.4f → %.4f, %d changes applied",
+            current_rms, final_rms, len(changes_applied),
         )
 
     async def _detect_non_broadcasting_scanners(self) -> list[BermudaDevice]:
@@ -1483,40 +1585,63 @@ class BermudaDataUpdateCoordinator(DataUpdateCoordinator):
                             device.position_room_id = result.room_id
                             device.position_floor_id = result.floor_id
 
-                            # Determine room from position and override area assignment if enabled
+                            # Determine room from position using smoothed probability tracker
                             if (
                                 self.map_rooms
                                 and self.options.get(CONF_TRILATERATION_OVERRIDE_AREA, True)
                                 and result.confidence
                                 >= self.options.get(CONF_TRILATERATION_AREA_MIN_CONFIDENCE, 30.0)
                             ):
-                                # Use room_id from trilateration if available, else look up from position
-                                room_area_id = result.room_id
-                                if not room_area_id:
-                                    room_area_id = find_room_for_position(
-                                        (filtered_x, filtered_y, filtered_z),
-                                        list(self.map_rooms.values()),
-                                        list(self.map_floors.values()) if self.map_floors else None,
+                                # Lazily initialize room probability tracker
+                                if device._room_probability_tracker is None:
+                                    device._room_probability_tracker = RoomProbabilityTracker(
+                                        smoothing_weight=self.options.get(
+                                            CONF_ROOM_SMOOTHING_WEIGHT, DEFAULT_ROOM_SMOOTHING_WEIGHT
+                                        ),
+                                        motion_sigma=self.options.get(
+                                            CONF_MOTION_SIGMA, DEFAULT_MOTION_SIGMA
+                                        ),
                                     )
 
-                                if room_area_id:
+                                # Get Kalman velocity-corrected predicted position for motion consistency
+                                predicted_position = None
+                                if device._kalman_location is not None:
+                                    predicted_position = device._kalman_location.get_prediction()
+
+                                # Update room probabilities with smoothed position
+                                smoothed_room_id = device._room_probability_tracker.update(
+                                    (filtered_x, filtered_y, filtered_z),
+                                    list(self.map_rooms.values()),
+                                    list(self.map_floors.values()) if self.map_floors else None,
+                                    predicted_position=predicted_position,
+                                )
+
+                                result.room_id = smoothed_room_id
+                                device.position_room_id = smoothed_room_id
+
+                                if smoothed_room_id:
                                     # Map to HA Area
-                                    area = self.ar.async_get_area(room_area_id)
+                                    area = self.ar.async_get_area(smoothed_room_id)
                                     if area:
                                         # Override the distance-based area assignment
                                         old_area = device.area_name
                                         device._update_area_and_floor(area.id)
-                                        _LOGGER.info(
-                                            "Device %s area: %s → %s via trilateration (confidence: %.1f%%)",
-                                            device.name,
-                                            old_area or "None",
-                                            area.name,
-                                            result.confidence,
-                                        )
+                                        if old_area != area.name:
+                                            _LOGGER.info(
+                                                "Device %s area: %s → %s via trilateration "
+                                                "(confidence: %.1f%%, room_prob: %.2f)",
+                                                device.name,
+                                                old_area or "None",
+                                                area.name,
+                                                result.confidence,
+                                                device._room_probability_tracker.probabilities.get(
+                                                    smoothed_room_id, 0
+                                                ),
+                                            )
                                     else:
                                         _LOGGER.warning(
                                             "Room area_id '%s' not found in Home Assistant Areas",
-                                            room_area_id,
+                                            smoothed_room_id,
                                         )
                                 else:
                                     _LOGGER.debug(

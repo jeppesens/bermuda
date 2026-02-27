@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .const import _LOGGER
+from .const import CONF_NEAREST_NODE_MAX_DISTANCE
+from .const import CONF_NW_BANDWIDTH
+from .const import CONF_TRILATERATION_USE_VARIANCE_WEIGHTING
+from .const import DEFAULT_NEAREST_NODE_MAX_DISTANCE
+from .const import DEFAULT_NW_BANDWIDTH
+from .const import DEFAULT_TRILATERATION_USE_VARIANCE_WEIGHTING
 from .const import TRILATERATION_POSITION_TIMEOUT
 from .util import validate_scanners_for_trilateration
 
@@ -50,7 +56,7 @@ def calculate_position(
     Pipeline:
     1. Gather valid scanners with positions and distances
     2. Filter by floor (if floor config available)
-    3. Run Nadaraya-Watson (3+ scanners) or midpoint (2 scanners)
+    3. Run Nadaraya-Watson with Gaussian kernel (2+ scanners)
     4. Fall back to nearest node (1 scanner)
     5. Find room from calculated position
 
@@ -97,11 +103,17 @@ def calculate_position(
             scanner_count,
         )
 
+    # Get NW config from coordinator options
+    options = getattr(coordinator, "options", {})
+    bandwidth = options.get(CONF_NW_BANDWIDTH, DEFAULT_NW_BANDWIDTH)
+    use_variance = options.get(CONF_TRILATERATION_USE_VARIANCE_WEIGHTING, DEFAULT_TRILATERATION_USE_VARIANCE_WEIGHTING)
+
     # Route to algorithm
     if scanner_count >= 2:
-        result = _nadaraya_watson(valid_scanners, device, debug_enabled)
+        result = _nadaraya_watson(valid_scanners, device, debug_enabled, bandwidth=bandwidth, use_variance_weighting=use_variance)
     else:
-        result = _nearest_node(valid_scanners, device, debug_enabled)
+        max_dist = options.get(CONF_NEAREST_NODE_MAX_DISTANCE, DEFAULT_NEAREST_NODE_MAX_DISTANCE)
+        result = _nearest_node(valid_scanners, device, debug_enabled, max_distance=max_dist)
 
     if result is None:
         return None
@@ -200,18 +212,26 @@ def _nadaraya_watson(
     valid_scanners: list[tuple],
     device: BermudaDevice,
     debug_enabled: bool = False,
+    bandwidth: float = 0.5,
+    use_variance_weighting: bool = True,
 ) -> TrilaterationResult | None:
     """Nadaraya-Watson kernel regression for position estimation.
 
     Ported from ESPresense-companion's NadarayaWatsonMultilateralizer.
 
-    For 2 scanners: uses midpoint between them (insufficient for full regression).
-    For 3+ scanners: inverse-distance-squared weighting.
+    Uses Gaussian kernel weighting: K_h(d) = exp(-d² / (2h²))
+    where h is the bandwidth parameter (default 0.5, matching ESPresense).
+
+    When use_variance_weighting is enabled, weights are further adjusted by
+    measurement quality: weight *= 1/(1 + distance_variance). Scanners with
+    stable RSSI (low variance) contribute more to the position estimate.
 
     Args:
         valid_scanners: List of (scanner, advert) tuples, sorted by distance
         device: The device being positioned
         debug_enabled: Verbose logging
+        bandwidth: Gaussian kernel bandwidth (default 0.5, ESPresense default)
+        use_variance_weighting: Scale weights by measurement quality (1/(1+variance))
 
     Returns:
         TrilaterationResult or None
@@ -221,62 +241,32 @@ def _nadaraya_watson(
     if scanner_count < 2:
         return None
 
-    # Build scanner data: position and distance
+    # Build scanner data: position, distance, and variance
     positions: list[tuple[float, float, float]] = []
     distances: list[float] = []
+    variances: list[float] = []
     for scanner, advert in valid_scanners:
         if scanner.position is not None and advert.rssi_distance is not None:
             positions.append(scanner.position)
             distances.append(advert.rssi_distance)
+            variances.append(getattr(advert, "distance_variance", 0.0) or 0.0)
 
     n = len(positions)
     if n < 2:
         return None
 
-    # === 2 scanners: midpoint ===
-    if n == 2:
-        mx = (positions[0][0] + positions[1][0]) / 2.0
-        my = (positions[0][1] + positions[1][1]) / 2.0
-        mz = (positions[0][2] + positions[1][2]) / 2.0
-
-        # Simple error: difference between distances and distance-to-midpoint
-        error = 0.0
-        for i in range(2):
-            calc_dist = math.sqrt(
-                (mx - positions[i][0]) ** 2
-                + (my - positions[i][1]) ** 2
-                + (mz - positions[i][2]) ** 2
-            )
-            error += abs(calc_dist - distances[i])
-        error /= 2.0
-
-        confidence = _calculate_confidence(error, 0.0, n, n)
-
-        if debug_enabled:
-            _LOGGER.debug(
-                "NW 2-scanner midpoint: (%.2f, %.2f, %.2f) error=%.2f confidence=%d",
-                mx, my, mz, error, confidence,
-            )
-
-        return TrilaterationResult(
-            x=mx,
-            y=my,
-            z=mz,
-            confidence=confidence,
-            scanner_count=n,
-            method="nadaraya_watson",
-            error=error,
-        )
-
-    # === 3+ scanners: inverse-distance-squared weighting ===
-    epsilon = 0.01  # Prevent division by zero
+    # === 2+ scanners: Gaussian kernel weighted regression ===
+    h2 = 2.0 * bandwidth * bandwidth
     total_weight = 0.0
     wx = 0.0
     wy = 0.0
     wz = 0.0
 
     for i in range(n):
-        weight = 1.0 / (distances[i] ** 2 + epsilon)
+        weight = math.exp(-distances[i] ** 2 / h2)
+        # Variance weighting: stable scanners (low variance) get higher weight
+        if use_variance_weighting and variances[i] > 0:
+            weight *= 1.0 / (1.0 + variances[i])
         wx += positions[i][0] * weight
         wy += positions[i][1] * weight
         wz += positions[i][2] * weight
@@ -284,16 +274,17 @@ def _nadaraya_watson(
 
         if debug_enabled:
             _LOGGER.debug(
-                "  NW scanner %d: pos=(%.2f,%.2f,%.2f) dist=%.2fm weight=%.4f",
+                "  NW scanner %d: pos=(%.2f,%.2f,%.2f) dist=%.2fm var=%.3f weight=%.6f",
                 i,
                 positions[i][0],
                 positions[i][1],
                 positions[i][2],
                 distances[i],
+                variances[i],
                 weight,
             )
 
-    if total_weight < 1e-10:
+    if total_weight == 0.0:
         return None
 
     x = wx / total_weight
@@ -306,7 +297,7 @@ def _nadaraya_watson(
         return None
 
     # Calculate weighted error (residual between estimated and measured distances)
-    error = _calculate_weighted_error(x, y, z, positions, distances)
+    error = _calculate_weighted_error(x, y, z, positions, distances, bandwidth)
 
     # Calculate Pearson correlation between measured and calculated distances
     correlation = _pearson_correlation(x, y, z, positions, distances)
@@ -336,11 +327,13 @@ def _nearest_node(
     valid_scanners: list[tuple],
     device: BermudaDevice,
     debug_enabled: bool = False,
+    max_distance: float = 10.0,
 ) -> TrilaterationResult | None:
     """Nearest node fallback locator.
 
     Used when fewer than 2 scanners are available.
     Returns the nearest scanner's position with very low confidence.
+    Rejects if distance exceeds max_distance (ESPresense default: 10m).
 
     Ported from ESPresense-companion's NearestNode.cs.
     """
@@ -349,6 +342,17 @@ def _nearest_node(
 
     nearest_scanner, nearest_advert = valid_scanners[0]
     if nearest_scanner.position is None:
+        return None
+
+    # ESPresense: reject if device is too far from nearest scanner
+    if nearest_advert.rssi_distance is not None and nearest_advert.rssi_distance > max_distance:
+        if debug_enabled:
+            _LOGGER.debug(
+                "Nearest node: %s too far (%.2fm > %.2fm max)",
+                nearest_scanner.name,
+                nearest_advert.rssi_distance,
+                max_distance,
+            )
         return None
 
     x, y, z = nearest_scanner.position
@@ -389,24 +393,25 @@ def _calculate_weighted_error(
     z: float,
     positions: list[tuple[float, float, float]],
     distances: list[float],
+    bandwidth: float = 0.5,
 ) -> float:
     """Calculate weighted residual error between estimated and measured distances.
 
     Returns the weighted average of |calculated_distance - measured_distance|,
-    where weight = 1 / (measured_distance^2 + epsilon).
+    using the same Gaussian kernel as Nadaraya-Watson for consistency.
     """
-    epsilon = 0.01
+    h2 = 2.0 * bandwidth * bandwidth
     total_weighted_error = 0.0
     total_weight = 0.0
 
     for i, (px, py, pz) in enumerate(positions):
         calc_dist = math.sqrt((x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2)
         residual = abs(calc_dist - distances[i])
-        weight = 1.0 / (distances[i] ** 2 + epsilon)
+        weight = math.exp(-distances[i] ** 2 / h2)
         total_weighted_error += residual * weight
         total_weight += weight
 
-    if total_weight < 1e-10:
+    if total_weight == 0.0:
         return 0.0
 
     return total_weighted_error / total_weight
@@ -581,3 +586,126 @@ def find_room_for_position(
             return room.get("area_id") or room.get("id") or room.get("name")
 
     return None
+
+
+class RoomProbabilityTracker:
+    """Per-device room probability tracker with EMA smoothing.
+
+    Prevents rapid room switching by maintaining a smoothed probability
+    distribution across all rooms. The device is assigned to the room
+    with highest smoothed probability.
+
+    ESPresense-compatible: P_new = alpha * P_old + (1 - alpha) * P_measured
+    where alpha (smoothing_weight) defaults to 0.7.
+
+    Optional motion consistency weighting (ESPresense MultiScenarioLocator):
+    rooms far from the Kalman-predicted position are downweighted using
+    weight = exp(-d² / (2 * motion_sigma²)), motion_sigma defaults to 2.0m.
+    """
+
+    def __init__(self, smoothing_weight: float = 0.7, motion_sigma: float = 2.0) -> None:
+        """Initialize tracker.
+
+        Args:
+            smoothing_weight: How much of prior belief to retain (0-1).
+                0.7 means 70% prior + 30% new measurement. Higher = smoother.
+            motion_sigma: Gaussian sigma for motion consistency weighting (meters).
+                Rooms further than this from predicted position are penalized.
+        """
+        self.smoothing_weight = smoothing_weight
+        self.motion_sigma = motion_sigma
+        self._probabilities: dict[str, float] = {}
+        self._current_room: str | None = None
+
+    def update(
+        self,
+        position: tuple[float, float, float],
+        rooms: list[dict],
+        floors: list[dict] | None = None,
+        predicted_position: tuple[float, float, float] | None = None,
+    ) -> str | None:
+        """Update room probabilities with new position measurement.
+
+        Args:
+            position: (x, y, z) calculated position
+            rooms: List of room definitions with 'points' polygons
+            floors: Optional floor definitions for z-based filtering
+            predicted_position: Kalman-predicted position for motion consistency
+
+        Returns:
+            Room ID with highest smoothed probability, or None
+        """
+        x, y = position[0], position[1]
+
+        # Compute raw membership for each room (binary: in polygon or not)
+        measured: dict[str, float] = {}
+        for room in rooms:
+            points = room.get("points", [])
+            if len(points) < 3:
+                continue
+            room_id = room.get("area_id") or room.get("id") or room.get("name")
+            if room_id is None:
+                continue
+            polygon = [(p[0], p[1]) for p in points]
+            in_room = 1.0 if point_in_polygon((x, y), polygon) else 0.0
+
+            # Motion consistency: downweight rooms far from predicted position
+            if predicted_position is not None and in_room > 0 and self.motion_sigma > 0:
+                centroid_x = sum(p[0] for p in points) / len(points)
+                centroid_y = sum(p[1] for p in points) / len(points)
+                dist_sq = (
+                    (centroid_x - predicted_position[0]) ** 2
+                    + (centroid_y - predicted_position[1]) ** 2
+                )
+                motion_weight = math.exp(-dist_sq / (2.0 * self.motion_sigma ** 2))
+                measured[room_id] = in_room * motion_weight
+            else:
+                measured[room_id] = in_room
+
+        if not measured:
+            return self._current_room
+
+        # Normalize measured probabilities (preserve motion-weighted ratios)
+        total_measured = sum(measured.values())
+        if total_measured > 0.01:
+            for rid in measured:
+                measured[rid] /= total_measured
+        else:
+            # All scores near zero (position not in any room, or motion
+            # weighting killed all candidates) — keep prior unchanged
+            for rid in measured:
+                measured[rid] = 0.0
+
+        # EMA smoothing: P_new = alpha * P_old + (1 - alpha) * P_measured
+        alpha = self.smoothing_weight
+        all_room_ids = set(self._probabilities.keys()) | set(measured.keys())
+        for rid in all_room_ids:
+            old_p = self._probabilities.get(rid, 0.0)
+            new_p = measured.get(rid, 0.0)
+            self._probabilities[rid] = alpha * old_p + (1.0 - alpha) * new_p
+
+        # Decay rooms no longer in the candidate set
+        for rid in list(self._probabilities.keys()):
+            if rid not in measured:
+                self._probabilities[rid] *= alpha
+                if self._probabilities[rid] < 0.01:
+                    del self._probabilities[rid]
+
+        # Select room with highest smoothed probability
+        if self._probabilities:
+            best_room = max(self._probabilities, key=self._probabilities.get)
+            best_prob = self._probabilities[best_room]
+            if best_prob > 0.3:
+                self._current_room = best_room
+
+        return self._current_room
+
+    @property
+    def current_room(self) -> str | None:
+        """Get current room assignment."""
+        return self._current_room
+
+    @property
+    def probabilities(self) -> dict[str, float]:
+        """Get current smoothed probabilities (for debugging/sensors)."""
+        return dict(self._probabilities)

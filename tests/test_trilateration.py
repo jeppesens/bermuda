@@ -9,6 +9,7 @@ import pytest
 from custom_components.bermuda.kalman import KalmanFilterSettings
 from custom_components.bermuda.kalman import KalmanLocation
 from custom_components.bermuda.trilateration import TrilaterationResult
+from custom_components.bermuda.trilateration import RoomProbabilityTracker
 from custom_components.bermuda.trilateration import calculate_position
 from custom_components.bermuda.trilateration import find_room_for_position
 from custom_components.bermuda.trilateration import point_in_polygon
@@ -239,8 +240,8 @@ class TestNadarayaWatson:
         # Should be strongly weighted toward s1 at (0,0)
         assert result.x < 5.0
 
-    def test_2_scanners_midpoint(self, mock_device, mock_scanner, mock_advert):
-        """Test 2 scanners should use midpoint."""
+    def test_2_scanners_equal_distance(self, mock_device, mock_scanner, mock_advert):
+        """Test 2 scanners at equal distance — result near midpoint."""
         scanner1 = mock_scanner("s1", (0.0, 0.0, 1.0), "Scanner1")
         scanner2 = mock_scanner("s2", (10.0, 0.0, 1.0), "Scanner2")
         mock_device._coordinator.devices = {"s1": scanner1, "s2": scanner2}
@@ -254,9 +255,27 @@ class TestNadarayaWatson:
         assert result is not None
         assert result.scanner_count == 2
         assert result.method == "nadaraya_watson"
-        # Should be at midpoint (5, 0)
-        assert abs(result.x - 5.0) < 0.1
+        # Equal distances → equal Gaussian weights → midpoint
+        assert abs(result.x - 5.0) < 0.5
         assert abs(result.y - 0.0) < 0.1
+
+    def test_2_scanners_weighted_by_distance(self, mock_device, mock_scanner, mock_advert):
+        """Test 2 scanners with different distances — closer scanner dominates."""
+        scanner1 = mock_scanner("s1", (0.0, 0.0, 1.0), "Scanner1")
+        scanner2 = mock_scanner("s2", (10.0, 0.0, 1.0), "Scanner2")
+        mock_device._coordinator.devices = {"s1": scanner1, "s2": scanner2}
+        mock_device.adverts = {
+            "s1": mock_advert("s1", 0.5, 100.0),  # Very close to s1
+            "s2": mock_advert("s2", 8.0, 100.0),   # Far from s2
+        }
+
+        result = calculate_position(mock_device, 101.0)
+
+        assert result is not None
+        assert result.scanner_count == 2
+        # With Gaussian kernel h=0.5, s2 at 8m gets ~0 weight
+        # Result should be strongly pulled toward s1 at (0, 0)
+        assert result.x < 2.0
 
     def test_4_scanners_square(self, mock_device, mock_scanner, mock_advert):
         """Test 4 scanners in a square with equal distances."""
@@ -368,7 +387,7 @@ class TestCalculatePositionEdgeCases:
             "s2": mock_advert("s2", 3.0, 100.0),
         }
 
-        # Should still produce a result (midpoint of identical positions)
+        # Should still produce a result (weighted average of identical positions)
         result = calculate_position(mock_device, 101.0)
         # Whether this returns a result depends on the implementation
         # At minimum it should not crash
@@ -577,3 +596,171 @@ filtering:
         assert result["_filtering"]["process_noise"] == 0.02
         assert result["_filtering"]["measurement_noise"] == 0.2
         assert result["_filtering"]["max_velocity"] == 0.8
+
+
+class TestGaussianKernel:
+    """Test Gaussian kernel weighting behavior."""
+
+    def test_close_scanner_dominates(self, mock_device, mock_scanner, mock_advert):
+        """With Gaussian kernel, a very close scanner should dominate over far ones."""
+        scanners = {
+            "s1": mock_scanner("s1", (0.0, 0.0, 1.0), "Close"),
+            "s2": mock_scanner("s2", (10.0, 0.0, 1.0), "Far1"),
+            "s3": mock_scanner("s3", (0.0, 10.0, 1.0), "Far2"),
+        }
+        mock_device._coordinator.devices = scanners
+        mock_device.adverts = {
+            "s1": mock_advert("s1", 0.3, 100.0),  # Very close
+            "s2": mock_advert("s2", 5.0, 100.0),
+            "s3": mock_advert("s3", 5.0, 100.0),
+        }
+
+        result = calculate_position(mock_device, 101.0)
+
+        assert result is not None
+        # With Gaussian h=0.5, far scanners at 5m get ~0 weight
+        # Result should be very near s1 at (0, 0)
+        assert result.x < 1.5
+        assert result.y < 1.5
+
+
+class TestRoomProbabilityTracker:
+    """Test room probability EMA smoothing."""
+
+    @pytest.fixture
+    def rooms(self):
+        """Two adjacent rooms."""
+        return [
+            {"id": "r1", "area_id": "r1", "points": [[0, 0], [10, 0], [10, 10], [0, 10]]},
+            {"id": "r2", "area_id": "r2", "points": [[10, 0], [20, 0], [20, 10], [10, 10]]},
+        ]
+
+    def test_initial_assignment(self, rooms):
+        """First update should assign room immediately."""
+        tracker = RoomProbabilityTracker(smoothing_weight=0.7)
+        result = tracker.update((5, 5, 1), rooms)
+        assert result == "r1"
+
+    def test_smoothing_prevents_instant_switch(self, rooms):
+        """Room should NOT switch on a single contrary measurement."""
+        tracker = RoomProbabilityTracker(smoothing_weight=0.7)
+        # Build up strong belief in room 1
+        for _ in range(10):
+            tracker.update((5, 5, 1), rooms)
+        assert tracker.current_room == "r1"
+
+        # Single measurement in room 2 should NOT switch
+        tracker.update((15, 5, 1), rooms)
+        assert tracker.current_room == "r1"
+
+    def test_sustained_switch(self, rooms):
+        """Sustained measurements in new room should eventually switch."""
+        tracker = RoomProbabilityTracker(smoothing_weight=0.7)
+        for _ in range(5):
+            tracker.update((5, 5, 1), rooms)
+        assert tracker.current_room == "r1"
+
+        # Many consecutive measurements in room 2
+        for _ in range(30):
+            tracker.update((15, 5, 1), rooms)
+        assert tracker.current_room == "r2"
+
+    def test_outside_all_rooms_keeps_previous(self, rooms):
+        """Position outside all rooms should keep previous assignment."""
+        tracker = RoomProbabilityTracker(smoothing_weight=0.7)
+        for _ in range(5):
+            tracker.update((5, 5, 1), rooms)
+        assert tracker.current_room == "r1"
+
+        # Move outside all rooms
+        tracker.update((25, 25, 1), rooms)
+        assert tracker.current_room == "r1"
+
+    def test_probabilities_accessible(self, rooms):
+        """Probabilities dict should be accessible for debugging."""
+        tracker = RoomProbabilityTracker(smoothing_weight=0.7)
+        tracker.update((5, 5, 1), rooms)
+        probs = tracker.probabilities
+        assert "r1" in probs
+        assert probs["r1"] > 0
+
+    def test_motion_consistency(self, rooms):
+        """Rooms far from predicted position should be downweighted."""
+        tracker = RoomProbabilityTracker(smoothing_weight=0.5, motion_sigma=1.0)
+        # Build up belief in room 1
+        for _ in range(5):
+            tracker.update((5, 5, 1), rooms)
+        assert tracker.current_room == "r1"
+
+        # Position says room 2, but predicted position is still in room 1.
+        # With tight motion_sigma=1.0, room 2 centroid is 10m from prediction,
+        # giving near-zero motion weight — prior in room 1 should hold.
+        result = tracker.update(
+            (15, 5, 1), rooms,
+            predicted_position=(5, 5, 1),
+        )
+        assert result == "r1"
+
+
+class TestOptimization:
+    """Test auto-optimization functions."""
+
+    def test_rms_error_perfect(self):
+        """RMS should be ~0 when parameters perfectly match the data."""
+        from custom_components.bermuda.optimization import calculate_rms_error
+
+        # Two scanners 5m apart, RSSI consistent with ref_power=-65, att=2.7
+        # At 5m: expected_rssi = -65 - 10*2.7*log10(5) = -65 - 18.86 = -83.86
+        import math
+        expected_rssi = -65.0 - 10 * 2.7 * math.log10(5.0)
+        pairs = {
+            ("s1", "s2"): [expected_rssi] * 10,
+        }
+        positions = {
+            "s1": (0.0, 0.0, 0.0),
+            "s2": (5.0, 0.0, 0.0),
+        }
+        rms = calculate_rms_error(pairs, positions, -65.0, 2.7)
+        assert rms < 0.1
+
+    def test_optimize_absorption_converges(self):
+        """Absorption optimizer should converge toward the true value."""
+        from custom_components.bermuda.optimization import optimize_absorption
+        import math
+
+        # Generate synthetic data with true attenuation = 3.0
+        true_att = 3.0
+        ref_power = -65.0
+        positions = {
+            "s1": (0.0, 0.0, 0.0),
+            "s2": (5.0, 0.0, 0.0),
+            "s3": (0.0, 5.0, 0.0),
+        }
+        pairs = {}
+        for (a, b) in [("s1", "s2"), ("s2", "s3"), ("s1", "s3")]:
+            dist = math.sqrt(sum((positions[a][i] - positions[b][i])**2 for i in range(3)))
+            rssi = ref_power - 10 * true_att * math.log10(dist)
+            pairs[(a, b)] = [rssi] * 20
+
+        best_att, _ = optimize_absorption(pairs, positions, ref_power, 2.7)
+        assert abs(best_att - true_att) < 0.2
+
+    def test_baseline_gating(self):
+        """Baseline should gate changes — reject if error increases."""
+        from custom_components.bermuda.optimization import OptimizationBaseline
+
+        baseline = OptimizationBaseline(required_snapshots=3)
+        assert not baseline.is_established
+
+        baseline.add_snapshot(1.0)
+        baseline.add_snapshot(1.2)
+        assert not baseline.is_established
+
+        baseline.add_snapshot(0.8)
+        assert baseline.is_established
+        assert baseline.baseline_error == pytest.approx(1.0, abs=0.01)
+
+        # Better error should be applied
+        assert baseline.should_apply(0.9) is True
+        # Worse error should be rejected
+        assert baseline.should_apply(1.1) is False

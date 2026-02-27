@@ -211,9 +211,11 @@ class AdaptivePercentileRSSI:
         # Filter values within fence
         survivors = [v for v in rssi_values if lower_fence <= v <= upper_fence]
 
-        # Return mean of survivors, or median if all were rejected
+        # Return P75 of survivors (ESPresense v4 uses 75th percentile — BLE noise
+        # typically drops RSSI/inflates distance, so higher percentile is truer).
+        # Fall back to median if all were rejected by the Tukey fence.
         if survivors:
-            return statistics.mean(survivors)
+            return self._calculate_percentile(sorted(survivors), 0.75)
         return q2_median
 
     def get_rssi_variance(self) -> float:
@@ -304,6 +306,10 @@ class BermudaAdvert(dict):
         self.rssi_distance: float | None = None
         self.rssi_distance_raw: float
         self.stale_update_count = 0  # How many times we did an update but no new stamps were found.
+
+        # 3-sample median pre-filter (ESPresense firmware equivalent)
+        # Removes single-sample RSSI spikes before they enter the adaptive filter.
+        self._median_prefilter: deque[float] = deque(maxlen=3)
 
         # Adaptive percentile RSSI filter for advanced outlier rejection
         self.adaptive_rssi_filter: AdaptivePercentileRSSI = AdaptivePercentileRSSI()
@@ -412,9 +418,14 @@ class BermudaAdvert(dict):
             self.rssi = advertisementdata.rssi
             self.hist_rssi.appendleft(self.rssi)
 
-            # Add to adaptive filter and update filtered RSSI
-            if new_stamp is not None:
-                self.adaptive_rssi_filter.add_measurement(self.rssi, new_stamp)
+            # Apply 3-sample median pre-filter then feed into adaptive filter
+            if new_stamp is not None and self.rssi is not None:
+                self._median_prefilter.append(self.rssi)
+                if len(self._median_prefilter) >= 3:
+                    median_rssi = sorted(self._median_prefilter)[1]
+                else:
+                    median_rssi = self.rssi
+                self.adaptive_rssi_filter.add_measurement(median_rssi, new_stamp)
                 self.rssi_filtered = self.adaptive_rssi_filter.get_median_iqr()
                 self.rssi_variance = self.adaptive_rssi_filter.get_rssi_variance()
                 self.distance_variance = self.adaptive_rssi_filter.get_distance_variance(
@@ -511,9 +522,22 @@ class BermudaAdvert(dict):
         immediately, perhaps between cycles, in order to reflect a
         setting change (such as altering a device's ref_power setting).
         """
-        # Check if we should use a device-based ref_power
-        if not self.ref_power:  # No user-supplied per-device value
-            # use global default
+        # Determine ref_power with ESPresense-compatible priority:
+        # 1. User-supplied per-device ref_power (manual calibration)
+        # 2. iBeacon beacon_power (broadcast in manufacturer data)
+        # 3. BLE tx_power from advertisement (generic devices)
+        # 4. Global default ref_power
+        if self.ref_power:
+            # User has manually calibrated this device
+            ref_power = self.ref_power
+        elif getattr(self._device, "beacon_power", None) is not None:
+            # iBeacon: use transmitted power level as ref_power
+            ref_power = self._device.beacon_power
+        elif self.tx_power is not None:
+            # Generic BLE: use advertisement tx_power as ref_power
+            ref_power = self.tx_power
+        else:
+            # Fall back to global default
             ref_power = self.conf_ref_power
 
             # Warn if ref_power seems unrealistic (likely misconfigured)
@@ -526,8 +550,6 @@ class BermudaAdvert(dict):
                     ref_power,
                     self._device.name,
                 )
-        else:
-            ref_power = self.ref_power
 
         distance = rssi_to_metres(self.rssi + self.conf_rssi_offset, ref_power, self.conf_attenuation)
         self.rssi_distance_raw = distance
